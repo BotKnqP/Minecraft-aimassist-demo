@@ -4,6 +4,7 @@
   "package": "com.mcbowagent.mixin",
   "compatibilityLevel": "JAVA_8",
   "client": [
+    "BowFovMixin",
     "MouseLookMixin"
   ],
   "injectors": {
