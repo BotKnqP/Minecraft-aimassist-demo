@@ -1,146 +1,85 @@
-# GPU acceleration: ORT-CUDA vs TensorRT
+# GPU acceleration via onnxruntime-gpu
 
-The default `onnxruntime-directml` build runs the YOLO ONNX through Microsoft's DirectML
-backend — it cooperates with Minecraft's GPU on Windows but is the SLOWEST GPU path. Two
-upgrades are available, both optional, both pick up automatically once installed.
+The default `onnxruntime-directml` build runs the YOLO ONNX through Microsoft's DirectML —
+it cooperates with Minecraft's GPU on Windows but is the slowest GPU path. Swap to
+`onnxruntime-gpu` to unlock the CUDA + TensorRT execution providers; `OrtDetector` auto-picks
+the fastest available.
 
-| Path | Latency on RTX 4060 @ 640×640 | Setup difficulty | Why pick it |
-|---|---|---|---|
-| **A. onnxruntime-gpu (CUDA EP)** | ~25–40 ms | one `pip` | 30–50 % faster than DML, near-zero work |
-| **B. TensorRT FP16 engine** | **~8–15 ms** | install TRT SDK + build engine | 3–4× faster than DML, peak inference perf |
+| Path | Latency on RTX 4060 @ 640×640 | Notes |
+|---|---|---|
+| DirectML (default) | ~50 ms | works anywhere, slow |
+| CUDA EP | **~8 ms** | one `pip install` (~6× DML) |
+| TensorRT EP (FP16) | **~3 ms** | first run compiles + caches an engine under `.trt_cache/` (~18× DML) |
 
-You can run either path WITHOUT changing the rest of the pipeline — `make_detector` routes
-`.onnx` → ORT and `.engine` → TensorRT automatically.
+You don't build an `.engine` yourself — onnxruntime's TensorRT EP does it on the first
+inference and caches the binary next to the weights. After that every run loads in <5 s.
 
 ---
 
-## Path A — onnxruntime-gpu (CUDA / TensorRT EP)
-
-Replaces the DirectML EP with CUDA + (bundled) TensorRT. Same .onnx file, faster runtime.
-
-### ⚠️ Version matrix (read this before installing)
+## Install (the version matrix matters)
 
 `pip install onnxruntime-gpu` (no version pin) gets the LATEST, which currently demands
-**CUDA 13.x + cuDNN 9.x** — most users on CUDA 11/12 will fall straight back to CPU and get
-~7 fps instead of 30+. Pick the version that matches your toolkit:
+**CUDA 13.x + cuDNN 9.x**. Most users on CUDA 11/12 must pin a compatible version or the
+GPU EPs silently fail and the runtime falls back to CPU (~7 fps, painful).
 
-| Your CUDA | Install command | Needs cuDNN |
+| Your CUDA | Install command | cuDNN |
 |---|---|---|
-| **12.x** (most current installs) | `pip install onnxruntime-gpu==1.19.2` | cuDNN **8.9** for CUDA 12 |
-| **11.8** | `pip install onnxruntime-gpu==1.18.1` | cuDNN **8.9** for CUDA 11 |
-| **13.x** (new install) | `pip install onnxruntime-gpu` (latest) | cuDNN **9.x** |
+| **12.x** (most current installs) | `pip install "onnxruntime-gpu==1.22.0"` | `pip install nvidia-cudnn-cu12` |
+| **11.8** | `pip install "onnxruntime-gpu==1.18.1"` | cuDNN 8.9 for CUDA 11 (NVIDIA dev site) |
+| **13.x** (new install) | `pip install onnxruntime-gpu` (latest) | `pip install nvidia-cudnn-cu12` |
 
-Check yours: `nvcc --version`. **Driver version (from `nvidia-smi`) is NOT the toolkit version** —
-nvidia-smi reports the driver-supported CUDA, not what's actually installed.
+Check yours: `nvcc --version`. **Driver version (from `nvidia-smi`) is NOT the toolkit
+version** — `nvidia-smi` reports the driver-supported CUDA, not what's actually installed.
 
-### Install
-
+For the full CUDA-12 quickstart that worked on the dev box (RTX 4060 Laptop, CUDA 12.6):
 ```powershell
-# remove DirectML build (the two packages can't coexist cleanly)
-pip uninstall -y onnxruntime-directml onnxruntime
-# install the CUDA build matching your toolkit (CUDA 12.x example)
-pip install onnxruntime-gpu==1.19.2
-# install cuDNN via pip wheel (avoids the NVIDIA developer-site download dance)
-pip install nvidia-cudnn-cu12
-# verify
+# C:\ on Windows is usually tiny; redirect pip TEMP to a roomy drive
+$env:TMP = "D:\pip-tmp"; $env:TEMP = "D:\pip-tmp"; $env:PIP_CACHE_DIR = "D:\pip-cache"
+New-Item -ItemType Directory -Force D:\pip-tmp, D:\pip-cache | Out-Null
+
+pip uninstall -y onnxruntime-directml onnxruntime onnxruntime-gpu
+pip install "onnxruntime-gpu==1.22.0"
+pip install nvidia-cudnn-cu12 nvidia-cublas-cu12 nvidia-cufft-cu12 `
+            nvidia-curand-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12 nvidia-cuda-runtime-cu12
+
+# OPTIONAL: also enable TensorRT EP (best speed). Match CUDA build (10.x for CUDA 12, 11.x for CUDA 13):
+pip install "tensorrt-cu12==10.7.0"
+
 python -c "import onnxruntime as ort; print(ort.get_available_providers())"
-# expected: ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
-# OR (if no TRT EP):  ['CUDAExecutionProvider', 'CPUExecutionProvider']
+# Expect:  ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
 ```
 
-If you see CUDA (or TRT) in the list, you're set. Run the agent:
+`OrtDetector._add_nvidia_dll_dirs` automatically adds `site-packages/nvidia/*/bin` and
+`site-packages/tensorrt_libs/` to PATH at session creation, so you don't have to edit
+your system PATH.
+
+---
+
+## Run
+
 ```powershell
 python -m mc_bow_agent.runtime_loop --weights runs/.../best.onnx --device cuda:0
 ```
-`OrtDetector` will print the providers it actually chose. If you get
-`providers=['CPUExecutionProvider']` instead, the GPU EPs failed to load — go back to DML:
-```powershell
-pip uninstall -y onnxruntime-gpu
-pip install onnxruntime-directml
+
+You'll see the chosen providers printed at startup:
+```
+[OrtDetector] providers=['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+              imgsz=640  nc=1  conf=0.25
 ```
 
-### Troubleshooting
-
-- **`Error 126: ...nvinfer_xx.dll missing`** — TensorRT runtime DLLs not on PATH. Either install the
-  full TensorRT SDK (Path B below) or stick with the CUDA EP (still ~1.5× DML).
-- **`Require cuDNN 9.* and CUDA 13.*`** — you installed too-new onnxruntime-gpu. Downgrade per the
-  table above.
-- **`Failed to create CUDAExecutionProvider`** — CUDA toolkit + cuDNN aren't both on PATH. If you
-  `pip install nvidia-cudnn-cu12`, add `D:\Python\Lib\site-packages\nvidia\cudnn\bin` to PATH.
+First TRT-EP run compiles an engine (2-5 min); subsequent runs load instantly from
+`.trt_cache/` next to the weights.
 
 ---
 
-## Path B — TensorRT engine
+## Troubleshooting
 
-Loads a prebuilt `.engine` file (CUDA kernels compiled offline for your specific GPU/precision).
+- **`providers=['CPUExecutionProvider']`** at startup → GPU EPs failed to load. Common causes:
+  - `Require cuDNN 9.* and CUDA 13.*` → installed onnxruntime-gpu is too new; pin per the table.
+  - `nvinfer_NN.dll missing` → TensorRT runtime DLLs not on PATH. Either `pip install tensorrt-cu12==10.7.0` (matches ORT 1.22 for CUDA 12) or skip TRT and keep just CUDA EP — still ~6× DML.
+  - `cufft64_NN.dll missing` → install the corresponding `nvidia-cufft-cu12` wheel.
+- **Build OOMs during first TRT-EP run** → workspace too big. The defaults in `OrtDetector` (`trt_max_workspace_size = 1 << 30` = 1 GB, `trt_builder_optimization_level = 3`) work on 8 GB cards; lower further on smaller GPUs.
+- **No GPU at all** → drop `--device cuda:0` and run on CPU; the agent still works, just slower.
 
-### 1. Install TensorRT
-
-NVIDIA TensorRT 8.6+ or 10.x. Two ways:
-
-**Easy path** (TRT 10+, RTX 40-series):
-```powershell
-pip install tensorrt cuda-python
-```
-Wheels include the runtime. You can build engines via the Python API (`build_engine.py` below)
-without needing the full SDK / `trtexec`.
-
-**Full SDK** (any GPU, also gives you `trtexec` for diagnostics):
-1. Go to https://developer.nvidia.com/tensorrt (NVIDIA account required)
-2. Download TensorRT 10.x ZIP for Windows + your CUDA version
-3. Unzip to e.g. `D:\TensorRT-10.x.y.z\`
-4. Add `D:\TensorRT-...\lib` to your `PATH`
-5. `pip install D:\TensorRT-...\python\tensorrt-*-cp312-*.whl` (match your Python version)
-6. `pip install cuda-python`
-7. Verify: `python -c "import tensorrt as trt; print(trt.__version__)"`
-
-### 2. Build the engine from your ONNX
-
-```powershell
-cd D:\projects\mc-bow-agent\python
-python -m mc_bow_agent.build_engine `
-    --onnx runs/detect/mcbow_zombie_v3/weights/best.onnx `
-    --output runs/detect/mcbow_zombie_v3/weights/best.engine `
-    --fp16
-```
-This takes 2–10 minutes (TRT tunes hundreds of kernels for your specific GPU). Output is a
-`best.engine` of ~30–50 MB.
-
-**Dynamic shape ONNX** (default since v0.4 `train.py`): the builder sets up a dynamic profile
-with `--min-imgsz 320 --opt-imgsz 640 --max-imgsz 640`. The engine accepts any input size in
-that range, and TRT picks the best kernels for the `opt` size. Pass `--max-imgsz 416` etc. if
-you want to lock the engine smaller for more speed.
-
-**Static shape ONNX**: the engine inherits the ONNX's fixed input shape — fastest, but
-you can only run at that exact `imgsz`.
-
-### 3. Run
-
-```powershell
-python -m mc_bow_agent.runtime_loop `
-    --weights runs/detect/mcbow_zombie_v3/weights/best.engine `
-    --device cuda:0
-```
-You'll see `[TrtDetector] loaded engine ...` at startup. The 20 Hz control rate should now be
-trivially achievable; if you raise `--send-hz 30` or higher, the mod's tick rate (20 Hz) becomes
-the bottleneck, not Python.
-
-### Caveats
-
-- **Engines are GPU/driver-specific.** An engine built on RTX 4060 will work on another 4060
-  with a similar driver, but not on different architectures. Rebuild after a major driver update.
-- **FP16 precision**: tested OK for YOLOv8 detection; can lower confidence by ~1–2 % vs FP32 in
-  rare cases. INT8 would be another 1.5–2× speedup but needs calibration data — not implemented
-  here. (`--int8` flag exists but errors out.)
-- **TensorRT/cuda-python install is fiddly on Windows.** If the wheel install fails, the SDK
-  download path always works.
-
----
-
-## Choosing
-
-- **Just want a clear win?** Path A. 5 minutes, ~1.5× speedup.
-- **Want the peak?** Path B. Half an hour the first time, ~3–4× speedup, lower latency
-  variance → smoother control loop.
-- **Both fall back gracefully**: if any GPU path fails (OOM, missing provider, bad engine),
-  the runtime falls back to CPU automatically; the bot keeps running, just slower.
+Engines are GPU/driver-specific. Rebuild (`rm -rf runs/.../weights/.trt_cache/`) after a
+major driver update or moving to a different machine.

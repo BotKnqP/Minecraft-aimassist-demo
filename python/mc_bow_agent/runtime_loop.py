@@ -13,7 +13,6 @@ cur_pitch+d_pitch) clamped <=10 deg/tick, hold the bow while fire_ok, release
 else release the bow (optionally slow-scan). See docs/RUNTIME_PROTOCOL.md.
 """
 import argparse
-import math
 import os
 import socket
 import threading
@@ -164,8 +163,7 @@ def run_client(detector, sock, k=DEFAULT_K, fov=DEFAULT_FOV, conf=0.5,
     # on a tick where no fresh detection arrived
     last_boxes = []
     last_engaging = False
-    last_capture_ms = None        # capture_ms of the last detection frame (for ESP drift compensation)
-    last_focal_px = None          # focal length cache (depends only on frame H + fov)
+    last_capture_ms = None        # capture_ms of the last detection frame (passed back to TargetState back-correction)
 
     last_send = 0.0
     frames = sends = targets = 0
@@ -213,7 +211,6 @@ def run_client(detector, sock, k=DEFAULT_K, fov=DEFAULT_FOV, conf=0.5,
                         state.reset()
                         last_engaging = False
                     last_boxes = boxes_payload(dets, target, last_engaging)
-                    last_focal_px = (last_h / 2.0) / math.tan(math.radians(fov) / 2.0)
                 if debug:
                     age = (time.time() * 1000.0 - last_capture_ms) if last_capture_ms else -1
                     print(f"[recv] frame#{frames} bytes={len(png)} det={len(dets)} "

@@ -105,17 +105,6 @@ def test_on_measurement_back_corrects_by_capture_ms():
     assert approx(bearing_dy, 5.5 - 4.5 - 2.475, 1e-6)
 
 
-def test_turn_since_sums_sends_after_capture():
-    s = TargetState()
-    s.on_measurement(d_yaw=0.0, d_pitch=0.0, bbox_h=40, bbox_w=20, conf=0.9, now_ms=0.0)
-    s.on_send(sent_d_yaw=5.0, sent_d_pitch=0.0, now_ms=10.0)    # mod turn ~2.25 yaw
-    s.on_send(sent_d_yaw=5.0, sent_d_pitch=0.0, now_ms=60.0)    # mod turn ~2.25 yaw
-    s.on_send(sent_d_yaw=5.0, sent_d_pitch=0.0, now_ms=110.0)   # mod turn ~2.25 yaw
-    # frame captured at t=50 -> sends with ts >= 50 are the 2nd and 3rd
-    dy, dp = s.turn_since(capture_ms=50.0)
-    assert approx(dy, 2.25 + 2.25, 1e-6) and approx(dp, 0.0, 1e-6)
-
-
 def test_predict_window_drops_target_after_grace():
     """Per GPT's acceptance criteria: 300 ms after last measurement, has_target falls to False."""
     s = TargetState(max_predict_ms=300)

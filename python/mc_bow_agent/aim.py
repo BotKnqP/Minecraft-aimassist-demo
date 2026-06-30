@@ -122,23 +122,6 @@ def aim_at(det: Detection, frame_w, frame_h, fov_deg, k=None, max_range=40.0) ->
                        drop_deg=drop, fireable=rng <= max_range)
 
 
-def _ang_off(d: Detection, frame_w, frame_h, fov_deg) -> float:
-    """Full angular distance (deg) of a detection's centre from the crosshair — the FOV-cone metric."""
-    dy, dp = bearing_from_bbox(d.cx, d.cy, frame_w, frame_h, fov_deg)
-    return math.hypot(dy, dp)
-
-
-def _sel_cost(d: Detection, frame_w, frame_h, fov_deg) -> float:
-    """Aimbot selection cost (deg, LOWER=better): angular distance to the crosshair with pitch
-    down-weighted (vertical bbox/aim noise is larger), minus a small, CAPPED size nudge so that among
-    near-equally-centred targets the closer (bigger) one wins — but size can never overturn a >~1.5°
-    angular lead (letting it do so is exactly what whipped the view to big screen-edge boxes)."""
-    dy, dp = bearing_from_bbox(d.cx, d.cy, frame_w, frame_h, fov_deg)
-    ang = math.sqrt(dy * dy + 0.5 * dp * dp)
-    area_norm = d.area / max(frame_w * frame_h, 1.0)
-    return ang - 1.5 * min(area_norm * 8.0, 1.0)
-
-
 def _prep_bearings(dets, frame_w, frame_h, fov_deg):
     """Precompute (det, d_yaw, d_pitch, ang_off, sel_cost) ONCE per frame — the hot paths
     (TargetTracker.select, _acquire_or_approach, the in-cone scans) used to recompute each detection's

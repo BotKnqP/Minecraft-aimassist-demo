@@ -122,17 +122,6 @@ class TargetState:
         self._st.bearing_dy -= ey
         self._st.bearing_dp -= ep
 
-    def turn_since(self, capture_ms: float) -> tuple:
-        """Sum of (expected_yaw_turn, expected_pitch_turn) for every send AT OR AFTER capture_ms.
-        Used to drift-correct the ESP overlay's box positions between detection frames."""
-        dy_sum = 0.0
-        dp_sum = 0.0
-        for ts, dy_t, dp_t in self._sends:
-            if ts >= capture_ms:
-                dy_sum += dy_t
-                dp_sum += dp_t
-        return dy_sum, dp_sum
-
     def current_bearing(self) -> tuple:
         """(d_yaw, d_pitch, bbox_h, bbox_w, conf). Caller should check has_target() first."""
         if self._st is None:

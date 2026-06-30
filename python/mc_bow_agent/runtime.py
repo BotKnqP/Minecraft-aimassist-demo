@@ -291,28 +291,14 @@ class OrtDetector:
 
 
 def make_detector(weights, conf=0.5, device="cpu", imgsz=640, backend="auto"):
-    """Pick the backend by file extension + availability:
-      .engine -> TrtDetector (TensorRT FP16/INT8; needs `pip install tensorrt cuda-python` plus a CUDA
-                 install + a prebuilt engine — see docs/TENSORRT.md and mc_bow_agent.build_engine)
-      .onnx   -> OrtDetector (onnxruntime DirectML/CUDA/CPU auto-pick) unless --backend ultralytics
-      .pt     -> Detector (Ultralytics; handles the PyTorch graph + OOM fallback)
+    """Pick the backend by file extension:
+      .onnx -> OrtDetector (onnxruntime; auto-picks TensorRT/CUDA/DirectML/CPU provider; for TRT-EP it
+               builds + caches a TRT engine on first run under .trt_cache/ next to the weights)
+      .pt   -> Detector (Ultralytics; PyTorch graph + automatic OOM fallback)
+    backend='ultralytics' forces the Ultralytics path even for .onnx.
     """
     w = str(weights).lower()
-    is_engine = w.endswith(".engine") or w.endswith(".plan") or w.endswith(".trt")
     is_onnx = w.endswith(".onnx")
-    if is_engine:
-        device_id = 0
-        if isinstance(device, str) and device.startswith("cuda:"):
-            try:
-                device_id = int(device.split(":", 1)[1])
-            except ValueError:
-                device_id = 0
-        try:
-            from .trt_detector import TrtDetector
-            return TrtDetector(weights, conf=conf, imgsz=imgsz, device_id=device_id)
-        except (ImportError, ModuleNotFoundError) as e:
-            raise RuntimeError(f"TensorRT path requested ({weights}) but TensorRT / cuda-python is not "
-                               f"installed: {e}. See docs/TENSORRT.md.") from e
     if backend == "ultralytics" or not is_onnx:
         return Detector(weights, conf=conf, device=device, imgsz=imgsz)
     try:
@@ -331,17 +317,6 @@ def decide(detector, frame, k=DEFAULT_K, fov=DEFAULT_FOV, conf_thresh=0.5):
     dets, (h, w) = detector.detect(frame)
     sol = solve_from_detections(dets, w, h, fov, k=k, conf_thresh=conf_thresh)
     return sol, len(dets), (w, h)
-
-
-# --- integration layer (needs the live game) -------------------------------
-# Frame SOURCE options:
-#   * mss.grab() of the Minecraft window (Python-side capture), or
-#   * the mod streams its 128x128 framebuffer over a localhost socket.
-# Action SINK: send {d_yaw, d_pitch, fire} to the mod over the socket; the mod's
-#   BowMacroController applies the per-tick clamped turn (<=10 deg/tick) and the
-#   use-hold/release. The mod knows the live pitch, so it can refine aim.d_pitch's
-#   flat-ground drop assumption with the true target elevation. TODO: implement
-#   run_live(detector, source, sink) once the mod's socket endpoint exists.
 
 
 def main(argv=None):
