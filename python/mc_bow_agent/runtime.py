@@ -118,8 +118,9 @@ class OrtDetector:
                     "trt_engine_cache_enable": True,
                     "trt_engine_cache_path": cache_dir,
                     "trt_fp16_enable": True,
-                    "trt_max_workspace_size": 1 << 31,    # 2 GB workspace
+                    "trt_max_workspace_size": 1 << 30,    # 1 GB workspace (2GB OOMed on this box; YOLOv8s fits easily)
                     "trt_timing_cache_enable": True,
+                    "trt_builder_optimization_level": 3,  # 3 = balanced (default 5 is slow + memory-heavy)
                 }))
             if "CUDAExecutionProvider" in available:
                 want.append("CUDAExecutionProvider")
@@ -177,22 +178,28 @@ class OrtDetector:
 
     @staticmethod
     def _add_nvidia_dll_dirs():
-        """Tell the OS loader where the pip-installed CUDA/cuDNN/cuBLAS DLLs live so onnxruntime's
-        CUDA EP can resolve them. Without this you get `Error 126: ...cudnn64_9.dll missing` even
+        """Tell the OS loader where the pip-installed CUDA/cuDNN/cuBLAS/TensorRT DLLs live so onnxruntime's
+        CUDA + TensorRT EPs can resolve them. Without this you get `Error 126: ...cudnn64_9.dll missing` even
         though `pip install nvidia-cudnn-cu12` succeeded."""
         import os
         import sys
-        for pkg in ("cudnn", "cublas", "cuda_runtime", "cuda_nvrtc", "cufft", "curand", "cusolver", "cusparse"):
-            d = os.path.join(sys.prefix, "Lib", "site-packages", "nvidia", pkg, "bin")
-            if os.path.isdir(d):
-                # both PATH (subprocess / older loaders) and add_dll_directory (Python 3.8+ on Win)
-                if d not in os.environ.get("PATH", ""):
-                    os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
-                if hasattr(os, "add_dll_directory"):
-                    try:
-                        os.add_dll_directory(d)
-                    except (OSError, FileNotFoundError):
-                        pass
+        candidates = []
+        # nvidia-* wheels (cuDNN / cuBLAS / cuFFT / ...)
+        for pkg in ("cudnn", "cublas", "cuda_runtime", "cuda_nvrtc", "cufft", "curand",
+                    "cusolver", "cusparse", "nvjitlink"):
+            candidates.append(os.path.join(sys.prefix, "Lib", "site-packages", "nvidia", pkg, "bin"))
+        # tensorrt wheel ships nvinfer_*.dll in tensorrt_libs/
+        candidates.append(os.path.join(sys.prefix, "Lib", "site-packages", "tensorrt_libs"))
+        for d in candidates:
+            if not os.path.isdir(d):
+                continue
+            if d not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+            if hasattr(os, "add_dll_directory"):
+                try:
+                    os.add_dll_directory(d)
+                except (OSError, FileNotFoundError):
+                    pass
 
     @staticmethod
     def _letterbox(im, new_size):
