@@ -114,21 +114,24 @@ class _LatestFrameRecv:
             self._event.set()
 
     def take(self, timeout=2.0):
-        """Block up to `timeout` s for the next frame; return (payload, eof) and clear the slot."""
+        """Block up to `timeout` s for the next frame; return (payload, eof) and clear the slot.
+        Buffered frames are delivered BEFORE a queued error/EOF is raised — otherwise a recv-thread crash
+        right after pushing a frame would discard the last live data."""
         self._event.wait(timeout=timeout)
-        if self._error is not None:
-            raise self._error
         with self._lock:
             payload = self._latest
             self._latest = None
-            if payload is None and not self._eof:
-                self._event.clear()                   # nothing here yet — wait again
-                return None, False
-            if payload is None and self._eof:
+            if payload is not None:
+                self._event.clear()                   # more frames will re-set this
+                return payload, False
+            if self._error is not None:
+                err = self._error
+                self._error = None                    # one-shot raise
+                raise err
+            if self._eof:
                 return None, True
-            # if more frames arrive before the next take(), they'll re-set the event
-            self._event.clear()
-        return payload, False
+            self._event.clear()                       # spurious wake / watchdog timeout
+            return None, False
 
     def dropped(self):
         return self._dropped

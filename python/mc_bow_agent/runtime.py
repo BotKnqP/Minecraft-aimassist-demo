@@ -99,28 +99,65 @@ class OrtDetector:
         self.iou = float(iou)
         self.max_det = int(max_det)
         available = set(ort.get_available_providers())
+        # Honor the user's stated device: when --device cuda* is requested, prefer CUDA over DirectML so
+        # multi-GPU CUDA selection (`cuda:1`, etc.) and explicit "I freed VRAM headroom" intent both work.
+        # The DirectML preference applies only when device is left at the default (so any GPU is fine).
         want = []
-        if str(device).startswith("cuda"):
-            if "DmlExecutionProvider" in available:
-                want.append("DmlExecutionProvider")
+        dev = str(device)
+        if dev.startswith("cuda"):
             if "CUDAExecutionProvider" in available:
                 want.append("CUDAExecutionProvider")
+            if "DmlExecutionProvider" in available:
+                want.append("DmlExecutionProvider")
         want.append("CPUExecutionProvider")
         opts = ort.SessionOptions()
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         self.session = ort.InferenceSession(weights, sess_options=opts, providers=want)
         self.input_name = self.session.get_inputs()[0].name
         ishape = self.session.get_inputs()[0].shape
-        # If the model has fixed input H/W, honor that over the user's imgsz (mismatched shapes throw).
+        # Honor a fixed input H/W if the model has one. Require it to be SQUARE — the letterbox path packs
+        # one scalar imgsz; a rectangular fixed input needs per-axis handling and is rare enough to refuse
+        # explicitly (clearer than a downstream shape mismatch at the first detect()).
         try:
             ih, iw = int(ishape[2]), int(ishape[3])
-            if ih > 0 and iw > 0 and (ih, iw) != (self.imgsz, self.imgsz):
-                print(f"[OrtDetector] model input shape is {ih}x{iw}; using that instead of imgsz={self.imgsz}")
-                self.imgsz = ih
         except (TypeError, ValueError, IndexError):
-            pass
+            ih = iw = -1
+        if ih > 0 and iw > 0:
+            if ih != iw:
+                raise ValueError(f"OrtDetector: rectangular fixed input {iw}x{ih} not supported; "
+                                 f"export the ONNX at a square size (e.g. yolo export imgsz=640).")
+            if ih != self.imgsz:
+                print(f"[OrtDetector] model input is fixed at {ih}x{ih}; using that instead of imgsz={self.imgsz}")
+                self.imgsz = ih
+        # Probe the OUTPUT shape with a dummy zeros frame so we know:
+        #   - layout is YOLOv8 (1, 4+nc, N), not YOLOv5/v7 (1, N, 4+1+nc) — refuse the latter loudly
+        #   - the model is single-class (nc == 1) — our NMS is class-agnostic; multi-class would cross-suppress
+        self._nc = 1
+        try:
+            import numpy as _np
+            probe = _np.zeros((1, 3, self.imgsz, self.imgsz), dtype=_np.float32)
+            probe_out = self.session.run(None, {self.input_name: probe})[0]
+        except Exception as e:
+            raise RuntimeError(f"OrtDetector: dummy inference failed at init ({e}); model may be invalid") from e
+        if probe_out.ndim != 3 or probe_out.shape[0] != 1:
+            raise ValueError(f"OrtDetector: unsupported output shape {probe_out.shape}; expected (1, 4+nc, N) "
+                             f"for YOLOv8.")
+        c, n = probe_out.shape[1], probe_out.shape[2]
+        # YOLOv8: dim 1 is 4+nc (small), dim 2 is N anchors (large). YOLOv5/v7 swap: dim 1 is N, dim 2 is 4+1+nc.
+        if c >= n:
+            raise ValueError(f"OrtDetector: output {probe_out.shape} looks like YOLOv5/v7 (or transposed); "
+                             f"OrtDetector currently supports YOLOv8 ONNX only — re-export with YOLOv8 or "
+                             f"use --backend ultralytics.")
+        nc = c - 4
+        if nc < 1:
+            raise ValueError(f"OrtDetector: output channel count {c} < 5; model has no class scores.")
+        if nc > 1:
+            raise ValueError(f"OrtDetector: multi-class model (nc={nc}) is not supported by the built-in NMS "
+                             f"(it is class-agnostic and would cross-suppress). Use --backend ultralytics, "
+                             f"or wait for per-class NMS support.")
+        self._nc = nc
         self.providers = self.session.get_providers()
-        print(f"[OrtDetector] providers={self.providers}  imgsz={self.imgsz}  conf={self.conf}")
+        print(f"[OrtDetector] providers={self.providers}  imgsz={self.imgsz}  nc={nc}  conf={self.conf}")
 
     @staticmethod
     def _letterbox(im, new_size):
@@ -180,16 +217,16 @@ class OrtDetector:
             frame = cv2.imread(frame)
         x, r, pad_l, pad_t, (h0, w0) = self._letterbox(frame, self.imgsz)
         out = self.session.run(None, {self.input_name: x})[0]
-        # YOLOv8 ONNX: (1, 4+nc, N) -> transpose to (N, 4+nc). 4 box dims + nc class scores.
-        if out.ndim == 3:
-            pred = out[0].T
-        else:
-            pred = out.T
+        # YOLOv8 ONNX layout is asserted (1, 4+nc, N) at __init__; refuse anything else.
+        pred = out[0].T
         if pred.shape[1] < 5:
             return [], (h0, w0)
         cls_scores = pred[:, 4:]
         scores = cls_scores.max(axis=1)
-        mask = scores >= self.conf
+        # confidence threshold + drop degenerate (zero/negative-area) boxes BEFORE NMS so they can't survive
+        # as phantom targets (which would feed the approach pan with nothing to actually shoot at)
+        pos = (pred[:, 2] > 0) & (pred[:, 3] > 0)
+        mask = (scores >= self.conf) & pos
         if not mask.any():
             return [], (h0, w0)
         pred = pred[mask]

@@ -200,17 +200,24 @@ public final class RuntimeBridge {
         }
     }
 
-    /** A parsed action — the only 4 fields controlTick actually reads. Removes the per-frame JsonObject
-     *  allocation in the hot path; both the binary and the legacy JSON branches populate this. */
+    /** A parsed action + its arrival timestamp and sequence — published as a single immutable object so
+     *  controlTick sees a consistent snapshot. Removes the per-frame JsonObject allocation in the hot path. */
     static final class RuntimeAction {
         final boolean hasTarget;
         final double dYaw;
         final double dPitch;
         final boolean fireOk;
-        RuntimeAction(boolean ht, double dy, double dp, boolean fo) {
+        final long timeMs;
+        final long seq;
+        RuntimeAction(boolean ht, double dy, double dp, boolean fo, long timeMs, long seq) {
             this.hasTarget = ht; this.dYaw = dy; this.dPitch = dp; this.fireOk = fo;
+            this.timeMs = timeMs; this.seq = seq;
         }
     }
+
+    private static final int MAX_ACTION_BYTES = 64 * 1024;   // 19 B header + 10 B per box * 100 max ~ 1 KB;
+                                                             // 64 KB is generous and catches corrupt/junk
+                                                             // length bytes BEFORE a giant alloc OOMs the JVM.
 
     /** Reader thread body: consume action frames forever; update latestAction + actionSeq + latestBoxes.
      *  Each payload is sniffed on the FIRST BYTE: 'A' = binary (fast path, no JsonParser/String alloc),
@@ -219,22 +226,24 @@ public final class RuntimeBridge {
         try {
             while (server != null && client != null) {
                 int n = in.readInt();
+                if (n < 0 || n > MAX_ACTION_BYTES) {
+                    throw new IOException("bad action length: " + n + " (out of [0," + MAX_ACTION_BYTES + "])");
+                }
                 byte[] buf = new byte[n];
                 in.readFully(buf);
-                RuntimeAction act;
+                boolean ht; double dy, dp; boolean fo;
                 int[][] boxes;
                 if (n > 0 && buf[0] == (byte) 'A') {
                     // binary: see protocol.py encode_action_bin for the exact layout
                     ByteBuffer bb = ByteBuffer.wrap(buf).order(ByteOrder.BIG_ENDIAN);
                     bb.get();                          // magic
-                    boolean ht = bb.get() != 0;
-                    float dy = bb.getFloat();
-                    float dp = bb.getFloat();
+                    ht = bb.get() != 0;
+                    dy = bb.getFloat();
+                    dp = bb.getFloat();
                     bb.getFloat();                     // range (unused by controlTick; still parsed for completeness)
-                    boolean fo = bb.get() != 0;
+                    fo = bb.get() != 0;
                     bb.getShort();                     // n_det (info-only)
                     int nBoxes = bb.getShort() & 0xffff;
-                    act = new RuntimeAction(ht, dy, dp, fo);
                     boxes = new int[nBoxes][];
                     for (int i = 0; i < nBoxes; i++) {
                         int x0 = bb.getShort();
@@ -248,19 +257,23 @@ public final class RuntimeBridge {
                     // legacy JSON path (kept for tests / older Python clients)
                     JsonObject o = new JsonParser()       // Gson 2.8.0 (MC 1.16.5)
                             .parse(new String(buf, StandardCharsets.UTF_8)).getAsJsonObject();
-                    act = new RuntimeAction(
-                            o.has("has_target") && o.get("has_target").getAsBoolean(),
-                            optD(o, "d_yaw"), optD(o, "d_pitch"),
-                            optB(o, "fire_ok"));
+                    ht = o.has("has_target") && o.get("has_target").getAsBoolean();
+                    dy = optD(o, "d_yaw");
+                    dp = optD(o, "d_pitch");
+                    fo = optB(o, "fire_ok");
                     boxes = parseBoxes(o);
                 }
-                latestAction = act;
-                latestBoxes = boxes;
-                lastActionTimeMs = System.currentTimeMillis();
-                actionSeq++;
-                trace(actionSeq <= VERBOSE_TICKS,
-                        "[mcbowagent] received action: seq={} d_yaw={} d_pitch={} fire_ok={}",
-                        actionSeq, act.dYaw, act.dPitch, act.fireOk);
+                // ATOMIC publish: bundle action+time+seq into one immutable, publish via a single volatile
+                // store so controlTick can never see a torn (latestAction old / actionSeq new) snapshot.
+                long now = System.currentTimeMillis();
+                long seq = actionSeq + 1;
+                latestBoxes = boxes;                   // boxes published independently — overlay-only, no
+                                                       // freshness/seq coupling needed
+                latestAction = new RuntimeAction(ht, dy, dp, fo, now, seq);
+                lastActionTimeMs = now;                // kept for any code still reading the legacy field
+                actionSeq = seq;
+                trace(seq <= VERBOSE_TICKS,
+                        "[mcbowagent] received action: seq={} d_yaw={} d_pitch={} fire_ok={}", seq, dy, dp, fo);
             }
         } catch (java.io.EOFException e) {
             // peer closed cleanly — normal exit
@@ -268,7 +281,11 @@ public final class RuntimeBridge {
             // socket closed by writer cleanup or peer reset — also normal exit during shutdown
             trace(actionSeq <= VERBOSE_TICKS, "[mcbowagent] reader exited: {}", e.toString());
         } catch (Exception e) {
-            LOGGER.error("[mcbowagent] reader thread error", e);
+            // Fatal parse error etc. Tear the client down (closeClient -> latestAction=null + interrupt
+            // frameLock so the writer's takeFrame unblocks and its next write throws), otherwise the
+            // writer would keep streaming frames into a void while the bot freezes on its last action.
+            LOGGER.error("[mcbowagent] reader thread error — closing client", e);
+            closeClient();
         }
     }
 
@@ -289,6 +306,11 @@ public final class RuntimeBridge {
         latestAction = null;       // req 3: never reuse a stale action after disconnect
         latestBoxes = null;
         lastActionTimeMs = 0;
+        // wake the writer thread if it's blocked in takeFrame.wait so it observes client==null and exits
+        synchronized (frameLock) {
+            frameToSend = null;
+            frameLock.notifyAll();
+        }
         if (c != null) {
             try { c.close(); } catch (IOException ignored) {}
         }
@@ -320,9 +342,10 @@ public final class RuntimeBridge {
         int interval = Math.max(1, cfg.runtimeCaptureInterval);
         if (controlTicks % interval == 0) captureRequested = true;
 
+        // Single volatile read -> consistent snapshot (atomic publish).
         RuntimeAction act = latestAction;
         long now = System.currentTimeMillis();
-        boolean fresh = act != null && (now - lastActionTimeMs) <= STALE_MS;
+        boolean fresh = act != null && (now - act.timeMs) <= STALE_MS;
         boolean hasTarget = fresh && act.hasTarget;
 
         if (hasTarget) {
@@ -330,8 +353,9 @@ public final class RuntimeBridge {
             double dPitch = act.dPitch;
             boolean fireOk = act.fireOk;
 
-            // turn ONCE per NEW action (no spin); the next frame reflects the turn
-            long seq = actionSeq;
+            // turn ONCE per NEW action (no spin); the next frame reflects the turn. Use act.seq (from the
+            // SAME snapshot we just read above) so the seq matches the dYaw/dPitch we'll apply.
+            long seq = act.seq;
             if (seq != lastAppliedActionSeq) {
                 lastAppliedActionSeq = seq;
                 prevAligned = lastAligned;               // remember the prior applied frame's alignment
