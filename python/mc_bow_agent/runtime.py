@@ -99,12 +99,24 @@ class OrtDetector:
         self.iou = float(iou)
         self.max_det = int(max_det)
         available = set(ort.get_available_providers())
-        # Honor the user's stated device: when --device cuda* is requested, prefer CUDA over DirectML so
-        # multi-GPU CUDA selection (`cuda:1`, etc.) and explicit "I freed VRAM headroom" intent both work.
-        # The DirectML preference applies only when device is left at the default (so any GPU is fine).
+        # Provider preference order when --device cuda*: TensorRT (peak speed via ONNX->TRT engine
+        # conversion, ORT handles it transparently) -> CUDA (vanilla CUDA EP, no engine compile) ->
+        # DirectML (shared-GPU friendly) -> CPU. TensorRT EP compiles a per-shape engine on FIRST
+        # inference (2-5 min) and caches it next to the weights — subsequent runs load instantly.
         want = []
         dev = str(device)
         if dev.startswith("cuda"):
+            if "TensorrtExecutionProvider" in available:
+                import os as _os
+                cache_dir = _os.path.join(_os.path.dirname(_os.path.abspath(weights)) or ".", ".trt_cache")
+                _os.makedirs(cache_dir, exist_ok=True)
+                want.append(("TensorrtExecutionProvider", {
+                    "trt_engine_cache_enable": True,
+                    "trt_engine_cache_path": cache_dir,
+                    "trt_fp16_enable": True,
+                    "trt_max_workspace_size": 1 << 31,    # 2 GB workspace
+                    "trt_timing_cache_enable": True,
+                }))
             if "CUDAExecutionProvider" in available:
                 want.append("CUDAExecutionProvider")
             if "DmlExecutionProvider" in available:

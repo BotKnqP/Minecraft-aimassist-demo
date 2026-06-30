@@ -16,6 +16,7 @@ runs/
 *.weights
 *.onnx
 *.engine
+.trt_cache/
 
 # fabric mod build
 mod/build/
