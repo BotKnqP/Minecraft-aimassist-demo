@@ -56,6 +56,22 @@ def test_nms_iou_threshold_just_above_keeps_both():
     assert OrtDetector._nms(boxes, scores, 0.2).tolist() == [0]
 
 
+def test_make_detector_routes_engine_to_trt():
+    """make_detector routes .engine -> TrtDetector. With TensorRT not installed it must raise a CLEAR
+    RuntimeError pointing at docs/TENSORRT.md (not a confusing NameError or ImportError leak)."""
+    try:
+        make_detector("does-not-exist.engine", backend="auto", device="cuda:0")
+    except RuntimeError as e:
+        msg = str(e)
+        assert "TensorRT" in msg or "trt_detector" in msg or "TENSORRT" in msg, f"unexpected: {e}"
+        return
+    except FileNotFoundError:
+        # tensorrt IS installed (the import succeeded) but the .engine file is missing.
+        # That's also a valid pass — proves routing reached TrtDetector.
+        return
+    assert False, "expected RuntimeError or FileNotFoundError for .engine routing"
+
+
 def test_make_detector_routes_by_extension():
     """make_detector should NOT instantiate a real Ultralytics for .pt unless onnxruntime is missing for
     .onnx — keep it cheap by passing a non-existent path and catching the expected error."""

@@ -249,11 +249,28 @@ class OrtDetector:
 
 
 def make_detector(weights, conf=0.5, device="cpu", imgsz=640, backend="auto"):
-    """Pick the backend by file extension + availability. `.pt` always goes through Ultralytics (it
-    handles the PyTorch graph + OOM fallback). `.onnx` prefers OrtDetector when onnxruntime is installed
-    and DirectML/CUDA/CPU providers can be selected, with a clean fall-through to Ultralytics if not.
-    backend='ultralytics' forces the Ultralytics path; 'onnxruntime' forces ORT and errors if missing."""
-    is_onnx = str(weights).lower().endswith(".onnx")
+    """Pick the backend by file extension + availability:
+      .engine -> TrtDetector (TensorRT FP16/INT8; needs `pip install tensorrt cuda-python` plus a CUDA
+                 install + a prebuilt engine — see docs/TENSORRT.md and mc_bow_agent.build_engine)
+      .onnx   -> OrtDetector (onnxruntime DirectML/CUDA/CPU auto-pick) unless --backend ultralytics
+      .pt     -> Detector (Ultralytics; handles the PyTorch graph + OOM fallback)
+    """
+    w = str(weights).lower()
+    is_engine = w.endswith(".engine") or w.endswith(".plan") or w.endswith(".trt")
+    is_onnx = w.endswith(".onnx")
+    if is_engine:
+        device_id = 0
+        if isinstance(device, str) and device.startswith("cuda:"):
+            try:
+                device_id = int(device.split(":", 1)[1])
+            except ValueError:
+                device_id = 0
+        try:
+            from .trt_detector import TrtDetector
+            return TrtDetector(weights, conf=conf, imgsz=imgsz, device_id=device_id)
+        except (ImportError, ModuleNotFoundError) as e:
+            raise RuntimeError(f"TensorRT path requested ({weights}) but TensorRT / cuda-python is not "
+                               f"installed: {e}. See docs/TENSORRT.md.") from e
     if backend == "ultralytics" or not is_onnx:
         return Detector(weights, conf=conf, device=device, imgsz=imgsz)
     try:
