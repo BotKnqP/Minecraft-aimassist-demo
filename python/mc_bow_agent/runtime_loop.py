@@ -15,13 +15,16 @@ else release the bow (optionally slow-scan). See docs/RUNTIME_PROTOCOL.md.
 import argparse
 import os
 import socket
+import threading
 import time
 from dataclasses import replace
 
-# Ease CUDA fragmentation when sharing the GPU with Minecraft. NOTE: expandable_segments is a Linux-only
-# allocator feature — PyTorch ignores it on Windows, where the real OOM mitigations are a smaller --imgsz and
-# the automatic CPU fallback (see Detector). Harmless to set on either OS; must be set BEFORE torch loads.
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# Ease CUDA fragmentation when sharing the GPU with Minecraft. expandable_segments is a Linux-only allocator
+# feature (PyTorch ignores it on Windows where it is a no-op), so gate it to Linux to keep the intent honest —
+# on Windows the actual OOM mitigations are smaller --imgsz and the automatic CPU fallback in Detector.
+import platform as _platform
+if _platform.system() == "Linux":
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from . import protocol as P
 from .aim import APPROACH_STEP_DEG, TargetTracker, aim_at
@@ -73,20 +76,85 @@ def _show_detections(frame, dets, target, sol):
     cv2.waitKey(1)
 
 
+class _LatestFrameRecv:
+    """Background socket reader: pulls frames as fast as the mod sends them and exposes only the LATEST
+    one to the main loop. Older frames silently drop. Pairs with the mod's pipelined writer (no lockstep)
+    so detection wall-clock is bounded by inference time alone, not by capture+inference+send round-trip."""
+
+    def __init__(self, sock):
+        self.sock = sock
+        self._lock = threading.Lock()
+        self._latest = None       # most-recent frame payload, or None
+        self._event = threading.Event()
+        self._eof = False
+        self._error = None
+        self._stop = threading.Event()
+        self._dropped = 0         # how many frames the main loop never saw (because a newer one arrived)
+        self._thread = threading.Thread(target=self._run, name="mcbow-recv", daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        try:
+            while not self._stop.is_set():
+                try:
+                    payload = P.recv_msg(self.sock)
+                except socket.timeout:
+                    continue                          # the 2s socket timeout is a watchdog; just loop
+                if payload is None:
+                    self._eof = True
+                    self._event.set()
+                    return
+                with self._lock:
+                    if self._latest is not None:
+                        self._dropped += 1            # we're about to overwrite -> the older frame is dropped
+                    self._latest = payload
+                self._event.set()
+        except Exception as e:
+            self._error = e
+            self._event.set()
+
+    def take(self, timeout=2.0):
+        """Block up to `timeout` s for the next frame; return (payload, eof) and clear the slot."""
+        self._event.wait(timeout=timeout)
+        if self._error is not None:
+            raise self._error
+        with self._lock:
+            payload = self._latest
+            self._latest = None
+            if payload is None and not self._eof:
+                self._event.clear()                   # nothing here yet — wait again
+                return None, False
+            if payload is None and self._eof:
+                return None, True
+            # if more frames arrive before the next take(), they'll re-set the event
+            self._event.clear()
+        return payload, False
+
+    def dropped(self):
+        return self._dropped
+
+    def close(self):
+        self._stop.set()
+
+
 def run_client(detector, sock, k=DEFAULT_K, fov=DEFAULT_FOV, conf=0.5,
                max_frames=None, on_step=None, debug=False, show=False, tracker=None):
-    """Drive the lock-step loop on an open socket. `detector` is any object with
-    detect(frame)->(detections, shape). Returns (frames, targets). Raises on a
-    socket abort/reset (caught by the caller's reconnect loop)."""
+    """Drive the pipelined loop on an open socket. The mod streams frames as soon as they're available;
+    a background recv thread keeps only the LATEST one for us so detection wall-clock no longer caps
+    capture rate. `detector` is any object with detect(frame)->(detections, shape). Returns
+    (frames, targets). Raises on a socket abort/reset (caught by the caller's reconnect loop)."""
     if tracker is None:
         tracker = TargetTracker()
+    recv = _LatestFrameRecv(sock)
     frames = targets = 0
     while max_frames is None or frames < max_frames:
-        png = P.recv_msg(sock)              # socket error -> propagate -> caller reconnects
+        png, eof = recv.take(timeout=2.0)
+        if eof:
+            break                             # mod closed the connection
         if png is None:
-            break  # mod closed the connection (clean EOF)
+            continue                          # watchdog timeout, keep waiting
         if debug:
-            print(f"[recv] frame_seq={frames} png_bytes={len(png)}")
+            print(f"[recv] frame_seq={frames} bytes={len(png)} dropped={recv.dropped()}")
 
         # Perception/aim is wrapped: a transient inference hiccup (e.g. cv2/torch OOM when
         # commit memory spikes) must NOT crash the program. On error we skip the frame and
@@ -113,7 +181,9 @@ def run_client(detector, sock, k=DEFAULT_K, fov=DEFAULT_FOV, conf=0.5,
 
         action = aim_to_action(sol, n_det=len(dets))
         action["boxes"] = boxes_payload(dets, target, getattr(tracker, "engaging", False))
-        P.send_msg(sock, P.encode_action(action))       # socket error -> propagate -> reconnect
+        # binary encoding: ~3-5x faster to parse on the mod side and no per-frame JsonObject/String allocations
+        # (the mod sniffs the leading byte, so a binary payload is auto-routed). Magic 'A' vs JSON '{'.
+        P.send_msg(sock, P.encode_action_bin(action))   # socket error -> propagate -> reconnect
         if debug:
             print(f"[send] d_yaw={action['d_yaw']} d_pitch={action['d_pitch']} "
                   f"range={action['range']} fire_ok={action['fire_ok']}")
@@ -126,6 +196,7 @@ def run_client(detector, sock, k=DEFAULT_K, fov=DEFAULT_FOV, conf=0.5,
         targets += 1 if sol is not None else 0
         if on_step is not None:
             on_step(frames, len(dets), sol, action)
+    recv.close()
     return frames, targets
 
 
@@ -144,8 +215,13 @@ def main(argv=None):
                          "a CUDA context here fights it for VRAM/commit). 'cuda:0' only if you "
                          "freed GPU + commit headroom.")
     ap.add_argument("--imgsz", type=int, default=None,
-                    help="inference size; default auto = 640 on GPU (the trained size -> best recall) / "
-                         "320 on CPU (speed). Pass e.g. 416 to override.")
+                    help="inference size; default auto = 416 on GPU (the source frame is 427x240 — pushing to "
+                         "640 only upsamples height with no extra signal) / 320 on CPU (speed). Pass 640 to "
+                         "match the trained size on a beefy GPU, or 256 for the lightest CPU runs.")
+    ap.add_argument("--backend", choices=("auto", "ultralytics", "onnxruntime"), default="auto",
+                    help="inference backend. auto = .pt -> Ultralytics, .onnx -> onnxruntime (with "
+                         "DirectML/CUDA/CPU provider auto-pick) if installed, else Ultralytics. "
+                         "Direct ORT is faster on .onnx at small imgsz and unlocks DirectML on Windows.")
     ap.add_argument("--debug-protocol", action="store_true",
                     help="print per-frame (seq, png bytes, shape) and per-action (d_yaw,d_pitch,range,fire_ok)")
     ap.add_argument("--show", action="store_true",
@@ -163,11 +239,11 @@ def main(argv=None):
                 device = "cpu"
         except Exception:
             device = "cpu"
-    imgsz = a.imgsz if a.imgsz is not None else (640 if str(device).startswith("cuda") else 320)
+    imgsz = a.imgsz if a.imgsz is not None else (416 if str(device).startswith("cuda") else 320)
     print(f"[runtime] device={device} imgsz={imgsz} conf={a.conf}")
 
-    from .runtime import Detector
-    detector = Detector(a.weights, conf=a.conf, device=device, imgsz=imgsz)
+    from .runtime import make_detector
+    detector = make_detector(a.weights, conf=a.conf, device=device, imgsz=imgsz, backend=a.backend)
 
     t0 = [time.time()]
 

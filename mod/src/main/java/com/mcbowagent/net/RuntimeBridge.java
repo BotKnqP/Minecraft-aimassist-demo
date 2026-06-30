@@ -5,6 +5,8 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 
 import org.apache.logging.log4j.LogManager;
@@ -63,7 +65,7 @@ public final class RuntimeBridge {
     private byte[] frameToSend = null;
 
     // net thread -> main thread
-    private volatile JsonObject latestAction = null;
+    private volatile RuntimeAction latestAction = null;
     private volatile long lastActionTimeMs = 0;
     private volatile int[][] latestBoxes = null;   // [x0,y0,x1,y1,role] per detection, for the HUD ESP overlay
 
@@ -80,7 +82,9 @@ public final class RuntimeBridge {
     private long lastAppliedActionSeq = -1;  // main thread only (which action we last TURNED on)
     private boolean lastAligned = false;     // main thread only
     private boolean prevAligned = false;     // main thread only (alignment of the PREVIOUS applied action)
-    private byte[] lastSentPng = null;       // main thread only (skip duplicate/stalled frames)
+    private long lastSentCrc = 0L;           // main thread only — dedup via CRC32 (avoids holding a 300 KB byte[])
+    private boolean haveLastSentCrc = false;
+    private final java.util.zip.CRC32 dedupCrc = new java.util.zip.CRC32();
     private long lastFireableMs = 0;         // main thread only (last time we had a fireable target)
     private int captureFailStreak = 0;       // main thread only (consecutive capture exceptions)
     private volatile boolean captureRequested = false;  // tick requests; the render thread does the readback
@@ -131,7 +135,7 @@ public final class RuntimeBridge {
         lastAppliedActionSeq = -1;
         lastAligned = false;
         prevAligned = false;
-        lastSentPng = null;
+        haveLastSentCrc = false;
         lastFireableMs = 0;
         captureFailStreak = 0;
         captureRequested = false;
@@ -170,29 +174,101 @@ public final class RuntimeBridge {
     }
 
     private void serveClient(DataInputStream in, DataOutputStream out) throws IOException {
-        while (server != null && client != null) {
-            byte[] png = takeFrame();
-            if (png == null) continue;            // no frame ready yet; re-check liveness
+        // PIPELINED: writer (this thread) sends frames as soon as the render thread produces them; a
+        // separate reader thread consumes actions as fast as Python returns them. This breaks the old
+        // lock-step ceiling: round-trip latency no longer bounds capture rate.  Latest-wins ordering on
+        // the mod side is preserved by actionSeq + lastAppliedActionSeq in controlTick — an action is
+        // applied at most once even if multiple arrive between control ticks.
+        final Thread reader = new Thread(() -> readActionsLoop(in), "mcbowagent-net-reader");
+        reader.setDaemon(true);
+        reader.start();
+        try {
+            while (server != null && client != null) {
+                byte[] payload = takeFrame();
+                if (payload == null) continue;        // no frame ready yet; re-check liveness
+                out.writeInt(payload.length);
+                out.write(payload);
+                out.flush();
+                frameSeq++;
+                trace(frameSeq <= VERBOSE_TICKS, "[mcbowagent] send frame success: seq={} bytes={}",
+                        frameSeq, payload.length);
+            }
+        } finally {
+            // close input -> reader.readInt throws -> reader exits cleanly
+            try { in.close(); } catch (IOException ignored) {}
+            try { reader.join(2000); } catch (InterruptedException ignored) {}
+        }
+    }
 
-            out.writeInt(png.length);
-            out.write(png);
-            out.flush();
-            frameSeq++;
-            trace(frameSeq <= VERBOSE_TICKS, "[mcbowagent] send frame success: seq={} bytes={}",
-                    frameSeq, png.length);
+    /** A parsed action — the only 4 fields controlTick actually reads. Removes the per-frame JsonObject
+     *  allocation in the hot path; both the binary and the legacy JSON branches populate this. */
+    static final class RuntimeAction {
+        final boolean hasTarget;
+        final double dYaw;
+        final double dPitch;
+        final boolean fireOk;
+        RuntimeAction(boolean ht, double dy, double dp, boolean fo) {
+            this.hasTarget = ht; this.dYaw = dy; this.dPitch = dp; this.fireOk = fo;
+        }
+    }
 
-            int n = in.readInt();                 // blocks until a reply (no timeout); throws if socket closed
-            byte[] buf = new byte[n];
-            in.readFully(buf);
-            JsonObject o = new JsonParser()       // Gson 2.8.0 (MC 1.16.5)
-                    .parse(new String(buf, StandardCharsets.UTF_8)).getAsJsonObject();
-            latestAction = o;
-            latestBoxes = parseBoxes(o);          // for the in-game ESP overlay (render thread reads it)
-            lastActionTimeMs = System.currentTimeMillis();
-            actionSeq++;
-            trace(actionSeq <= VERBOSE_TICKS,
-                    "[mcbowagent] received action: seq={} d_yaw={} d_pitch={} fire_ok={}",
-                    actionSeq, optD(o, "d_yaw"), optD(o, "d_pitch"), optB(o, "fire_ok"));
+    /** Reader thread body: consume action frames forever; update latestAction + actionSeq + latestBoxes.
+     *  Each payload is sniffed on the FIRST BYTE: 'A' = binary (fast path, no JsonParser/String alloc),
+     *  '{' = legacy JSON. Both produce a RuntimeAction + an int[][] of boxes. */
+    private void readActionsLoop(DataInputStream in) {
+        try {
+            while (server != null && client != null) {
+                int n = in.readInt();
+                byte[] buf = new byte[n];
+                in.readFully(buf);
+                RuntimeAction act;
+                int[][] boxes;
+                if (n > 0 && buf[0] == (byte) 'A') {
+                    // binary: see protocol.py encode_action_bin for the exact layout
+                    ByteBuffer bb = ByteBuffer.wrap(buf).order(ByteOrder.BIG_ENDIAN);
+                    bb.get();                          // magic
+                    boolean ht = bb.get() != 0;
+                    float dy = bb.getFloat();
+                    float dp = bb.getFloat();
+                    bb.getFloat();                     // range (unused by controlTick; still parsed for completeness)
+                    boolean fo = bb.get() != 0;
+                    bb.getShort();                     // n_det (info-only)
+                    int nBoxes = bb.getShort() & 0xffff;
+                    act = new RuntimeAction(ht, dy, dp, fo);
+                    boxes = new int[nBoxes][];
+                    for (int i = 0; i < nBoxes; i++) {
+                        int x0 = bb.getShort();
+                        int y0 = bb.getShort();
+                        int x1 = bb.getShort();
+                        int y1 = bb.getShort();
+                        int role = bb.getShort();
+                        boxes[i] = new int[]{x0, y0, x1, y1, role};
+                    }
+                } else {
+                    // legacy JSON path (kept for tests / older Python clients)
+                    JsonObject o = new JsonParser()       // Gson 2.8.0 (MC 1.16.5)
+                            .parse(new String(buf, StandardCharsets.UTF_8)).getAsJsonObject();
+                    act = new RuntimeAction(
+                            o.has("has_target") && o.get("has_target").getAsBoolean(),
+                            optD(o, "d_yaw"), optD(o, "d_pitch"),
+                            optB(o, "fire_ok"));
+                    boxes = parseBoxes(o);
+                }
+                latestAction = act;
+                latestBoxes = boxes;
+                lastActionTimeMs = System.currentTimeMillis();
+                actionSeq++;
+                trace(actionSeq <= VERBOSE_TICKS,
+                        "[mcbowagent] received action: seq={} d_yaw={} d_pitch={} fire_ok={}",
+                        actionSeq, act.dYaw, act.dPitch, act.fireOk);
+            }
+        } catch (java.io.EOFException e) {
+            // peer closed cleanly — normal exit
+        } catch (IOException e) {
+            // socket closed by writer cleanup or peer reset — also normal exit during shutdown
+            trace(actionSeq <= VERBOSE_TICKS, "[mcbowagent] reader exited: {}", e.toString());
+        } catch (Exception e) {
+            LOGGER.error("[mcbowagent] reader thread error", e);
         }
     }
 
@@ -244,15 +320,15 @@ public final class RuntimeBridge {
         int interval = Math.max(1, cfg.runtimeCaptureInterval);
         if (controlTicks % interval == 0) captureRequested = true;
 
-        JsonObject act = latestAction;
+        RuntimeAction act = latestAction;
         long now = System.currentTimeMillis();
         boolean fresh = act != null && (now - lastActionTimeMs) <= STALE_MS;
-        boolean hasTarget = fresh && act.has("has_target") && act.get("has_target").getAsBoolean();
+        boolean hasTarget = fresh && act.hasTarget;
 
         if (hasTarget) {
-            double dYaw = optD(act, "d_yaw");
-            double dPitch = optD(act, "d_pitch");
-            boolean fireOk = optB(act, "fire_ok");
+            double dYaw = act.dYaw;
+            double dPitch = act.dPitch;
+            boolean fireOk = act.fireOk;
 
             // turn ONCE per NEW action (no spin); the next frame reflects the turn
             long seq = actionSeq;
@@ -300,19 +376,29 @@ public final class RuntimeBridge {
             int w = mc.getWindow().getScaledWidth();
             int h = mc.getWindow().getScaledHeight();
             trace(v, "[mcbowagent] before capture {}x{}", w, h);
-            byte[] png = frameCapture.captureBytes(mc, w, h);
+            byte[] payload = cfg.runtimeRawFrame
+                    ? frameCapture.captureRawBytes(mc, w, h)   // fast path: raw BGR, no PNG encode
+                    : frameCapture.captureBytes(mc, w, h);     // legacy PNG path (still supported)
             captureFailStreak = 0;                   // a successful capture clears the failure streak
-            if (png == null) {
+            if (payload == null) {
                 trace(v, "[mcbowagent] capture returned null (framebuffer not ready?)");
-            } else if (sameFrame(png, lastSentPng)) {
-                trace(v, "[mcbowagent] duplicate frame (render stalled) - skip send");
-            } else {
-                lastSentPng = png;
-                trace(v, "[mcbowagent] capture success: bytes={} {}x{}", png.length, w, h);
-                synchronized (frameLock) {
-                    frameToSend = png;
-                    frameLock.notifyAll();
-                }
+                return;
+            }
+            // dedup via CRC32 — cheaper than Arrays.equals on 300 KB and avoids holding a hard ref to the last frame
+            dedupCrc.reset();
+            dedupCrc.update(payload, 0, payload.length);
+            long crc = dedupCrc.getValue();
+            if (haveLastSentCrc && crc == lastSentCrc) {
+                trace(v, "[mcbowagent] duplicate frame (crc match) - skip send");
+                return;
+            }
+            lastSentCrc = crc;
+            haveLastSentCrc = true;
+            trace(v, "[mcbowagent] capture success: bytes={} {}x{} fmt={}",
+                    payload.length, w, h, cfg.runtimeRawFrame ? "raw" : "png");
+            synchronized (frameLock) {
+                frameToSend = payload;
+                frameLock.notifyAll();
             }
         } catch (Exception e) {                      // transient GL/encode hiccup: skip the frame, keep the client
             captureFailStreak++;
@@ -337,10 +423,6 @@ public final class RuntimeBridge {
     private void trace(boolean verbose, String msg, Object... args) {
         if (verbose) LOGGER.info(msg, args);
         else LOGGER.debug(msg, args);
-    }
-
-    private static boolean sameFrame(byte[] a, byte[] b) {
-        return b != null && a.length == b.length && java.util.Arrays.equals(a, b);
     }
 
     private static double optD(JsonObject o, String k) {

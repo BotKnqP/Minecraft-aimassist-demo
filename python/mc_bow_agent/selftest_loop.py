@@ -21,6 +21,53 @@ def approx(a, b, t=1e-6):
     return abs(a - b) <= t
 
 
+def test_protocol_raw_frame_roundtrip():
+    """The mod's raw-BGR payload [magic 'R'][W u16 BE][H u16 BE][W*H*3 BGR] must decode losslessly to the
+    same HxWx3 BGR ndarray a PNG would. Locks in the wire format both sides depend on."""
+    import numpy as np
+    W, H = 17, 11
+    rng = np.arange(H * W * 3, dtype=np.uint8).reshape(H, W, 3)
+    payload = bytes([ord('R'), (W >> 8) & 0xff, W & 0xff, (H >> 8) & 0xff, H & 0xff]) + rng.tobytes()
+    out = P.decode_frame(payload)
+    assert out.shape == (H, W, 3)
+    assert out.dtype == np.uint8
+    assert np.array_equal(out, rng)
+
+
+def test_protocol_binary_action_roundtrip():
+    """encode_action_bin -> decode_action round-trips exactly. The mod sniffs the leading byte ('A' for
+    binary, '{' for JSON) so both encodings can flow over the same socket interchangeably."""
+    act = {"has_target": True, "d_yaw": 1.5, "d_pitch": -2.25, "range": 12.5, "fire_ok": True,
+           "n_det": 3, "boxes": [[10, 20, 30, 40, 1], [-5, 0, 5, 10, 2]]}
+    enc = P.encode_action_bin(act)
+    assert enc[0] == 0x41                              # magic 'A'
+    dec = P.decode_action(enc)
+    assert dec["has_target"] is True
+    assert approx(dec["d_yaw"], 1.5, 1e-4)
+    assert approx(dec["d_pitch"], -2.25, 1e-4)
+    assert approx(dec["range"], 12.5, 1e-4)
+    assert dec["fire_ok"] is True
+    assert dec["n_det"] == 3
+    assert dec["boxes"] == act["boxes"]
+    # round-trip the JSON branch through the same decoder too
+    j = P.encode_action(act)
+    assert chr(j[0]) == "{"
+    dec2 = P.decode_action(j)
+    assert dec2["has_target"] is True and dec2["boxes"] == act["boxes"]
+
+
+def test_protocol_raw_frame_size_mismatch_raises():
+    """A truncated raw payload must fail loudly, not silently produce a garbage frame."""
+    import numpy as np
+    payload = bytes([ord('R'), 0, 4, 0, 4]) + (b"\x00" * 7)   # claims 4x4 BGR = 48B but only 7B given
+    try:
+        P.decode_frame(payload)
+    except ValueError as e:
+        assert "size mismatch" in str(e), e
+        return
+    assert False, "expected ValueError on size mismatch"
+
+
 class FakeDetector:
     """One big centred zombie regardless of frame content (deterministic)."""
     def detect(self, frame):

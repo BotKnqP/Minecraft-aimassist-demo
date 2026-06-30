@@ -32,10 +32,10 @@ Getting the detector is a self-contained loop: a Fabric mod records gameplay and
 - 🎯 **FPS-aimbot target logic** — selects the zombie nearest the **crosshair** inside an FOV cone (not the biggest box), commits to it with switch-hysteresis, and pans toward off-cone targets — so the view doesn't whip around. Then aim (bearing + range + arrow drop) → turn + fire. No privileged coordinates.
 - 🟩 **In-game ESP overlay** — while the runtime is on, the live YOLO boxes are drawn right on the game screen (red = engaged target, yellow = approaching, green = other). Toggle with **F9**; they're drawn *after* the detector's frame is captured, so they never feed back into detection.
 - 🏷️ **Free auto-labelled data** — the mod projects ground-truth mob AABBs to screen pixels, emitting perfect YOLO labels while you play.
-- 🔌 **Lock-step socket bridge** — the mod streams frames to a Python loop and applies the returned `{d_yaw, d_pitch, fire}` via a legal rotation-and-input "aimbot" (never teleports).
+- 🚀 **Pipelined low-overhead protocol** — raw-BGR frames (no PNG encode, ~10-20 ms saved per capture), binary action payload (no JSON parse), and writer/reader threads on both sides so detection wall-clock no longer caps capture rate. Magic-byte switched, so both raw/PNG and binary/JSON peers interoperate.
 - 🧮 **Exact ballistics** — tick-accurate arrow simulation (drag 0.99, gravity 0.05, full-charge speed 3.0 blk/tick) for drop compensation, and a data-fitted `distance = k / bbox_height` range model.
-- 🖥️ **CPU or GPU** — runs on CPU by default; `--device cuda:0` infers at the trained 640px and **auto-falls back to CPU on OOM** (so a shared GPU never crashes the bot).
-- ✅ **Tested core** — pure-logic modules (action mapping, ballistics, aim, protocol, dataset) ship with self-tests.
+- 🖥️ **CPU or GPU, two backends** — runs on CPU by default; `--device cuda:0` runs through `onnxruntime` (DirectML on Windows → CUDA → CPU provider auto-pick) and **auto-falls back to CPU on OOM**. `.pt` weights stay on the Ultralytics path; `.onnx` uses the faster direct ORT path when installed.
+- ✅ **Tested core** — pure-logic modules (action mapping, ballistics, aim, protocol, dataset, ORT pre/post) ship with self-tests (31 tests, all green).
 
 ### How it works
 

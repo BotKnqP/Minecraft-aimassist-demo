@@ -128,11 +128,42 @@ def _sel_cost(d: Detection, frame_w, frame_h, fov_deg) -> float:
     return ang - 1.5 * min(area_norm * 8.0, 1.0)
 
 
+def _prep_bearings(dets, frame_w, frame_h, fov_deg):
+    """Precompute (det, d_yaw, d_pitch, ang_off, sel_cost) ONCE per frame — the hot paths
+    (TargetTracker.select, _acquire_or_approach, the in-cone scans) used to recompute each detection's
+    bearings 3-5 times with separate atan2 calls. Returns a list of tuples in dets order."""
+    f = focal_px(frame_h, fov_deg)
+    cx0 = frame_w / 2.0
+    cy0 = frame_h / 2.0
+    area_div = max(frame_w * frame_h, 1.0)
+    out = []
+    for d in dets:
+        dy = math.degrees(math.atan2(d.cx - cx0, f))
+        dp = math.degrees(math.atan2(d.cy - cy0, f))
+        ang = math.hypot(dy, dp)
+        cost = math.sqrt(dy * dy + 0.5 * dp * dp) - 1.5 * min((d.area / area_div) * 8.0, 1.0)
+        out.append((d, dy, dp, ang, cost))
+    return out
+
+
+def _argmin_in_prep(prep, max_off_deg, exclude=None) -> Optional[Detection]:
+    """Lowest-cost detection in a precomputed prep list whose ang_off is within max_off_deg (or None)."""
+    best = None
+    best_cost = float("inf")
+    for d, _, _, ang, cost in prep:
+        if d is exclude or ang > max_off_deg:
+            continue
+        if cost < best_cost:
+            best_cost = cost
+            best = d
+    return best
+
+
 def _argmin_in_cone(dets, frame_w, frame_h, fov_deg, max_off_deg, exclude=None) -> Optional[Detection]:
-    """Lowest-cost detection whose centre is within `max_off_deg` of the crosshair (or None)."""
-    cand = [d for d in dets if d is not exclude
-            and _ang_off(d, frame_w, frame_h, fov_deg) <= max_off_deg]
-    return min(cand, key=lambda d: _sel_cost(d, frame_w, frame_h, fov_deg)) if cand else None
+    """Lowest-cost detection whose centre is within `max_off_deg` of the crosshair (or None).
+    Stateless entry kept for solve_from_detections / external callers; the live loop uses
+    _argmin_in_prep against a cached prep list."""
+    return _argmin_in_prep(_prep_bearings(dets, frame_w, frame_h, fov_deg), max_off_deg, exclude)
 
 
 def pick_target(dets, frame_w, frame_h, fov_deg, conf_thresh=0.25,
@@ -218,16 +249,16 @@ class TargetTracker:
         a0, a1 = last.area, d.area
         return a1 <= self.size_ratio * a0 and a0 <= self.size_ratio * a1
 
-    def _acquire_or_approach(self, dets, frame_w, frame_h, fov_deg):
+    def _acquire_or_approach(self, prep):
         """Pick a target to aim at and set self.engaging. Prefer the crosshair-nearest one INSIDE the fire
         cone (engaging=True -> aim + fire). If none is in-cone but zombies are visible elsewhere, return the
         crosshair-nearest OFF-cone one (engaging=False) so the bot turns toward it — this is how it 'looks
         to the other side' after clearing the targets in front, instead of idling with zombies on screen."""
-        incone = _argmin_in_cone(dets, frame_w, frame_h, fov_deg, self.acquire_fov)
+        incone = _argmin_in_prep(prep, self.acquire_fov)
         if incone is not None:
             self.engaging = True
             return self._commit(incone)
-        approach = _argmin_in_cone(dets, frame_w, frame_h, fov_deg, 180.0)   # nearest crosshair at ANY angle
+        approach = _argmin_in_prep(prep, 180.0)   # nearest crosshair at ANY angle
         self.engaging = False
         return self._commit(approach) if approach is not None else None
 
@@ -235,34 +266,44 @@ class TargetTracker:
         """dets: already conf-filtered Detections. Returns the target to aim at, or None (command nothing).
         Read self.engaging after: True = fire-ready (in cone), False = approaching an off-cone target."""
         self.engaging = False
+        # Cache (det, d_yaw, d_pitch, ang_off, sel_cost) once per call -> 3-5x fewer atan2/sqrt calls vs
+        # recomputing inside every helper (_ang_off, _sel_cost, _argmin_in_cone).
+        prep = _prep_bearings(dets, frame_w, frame_h, fov_deg) if dets else []
+
         # no lock -> acquire (in-cone) or approach (off-cone)
         if self._last is None:
-            return self._acquire_or_approach(dets, frame_w, frame_h, fov_deg)
+            return self._acquire_or_approach(prep)
 
         self._since_commit += 1
 
-        # is the committed target present this frame? (identity gate)
+        # is the committed target present this frame? (identity gate). Find by spatial proximity, then verify.
         matched = None
-        if dets:
-            cur = min(dets, key=lambda d: (d.cx - self._last.cx) ** 2 + (d.cy - self._last.cy) ** 2)
-            if self._matches(cur, frame_w, frame_h):
-                matched = cur
+        matched_tuple = None
+        if prep:
+            matched_tuple = min(prep, key=lambda t: (t[0].cx - self._last.cx) ** 2 + (t[0].cy - self._last.cy) ** 2)
+            if self._matches(matched_tuple[0], frame_w, frame_h):
+                matched = matched_tuple[0]
+            else:
+                matched_tuple = None
 
         if matched is not None:
-            off = _ang_off(matched, frame_w, frame_h, fov_deg)
+            off = matched_tuple[3]   # ang_off from the cache (no extra atan2)
             # drifted past even the (wider) retain cone -> re-pick (in-cone engage, else approach)
             if off > self.retain_fov:
                 self._last = None
-                return self._acquire_or_approach(dets, frame_w, frame_h, fov_deg)
+                return self._acquire_or_approach(prep)
             # switch-hysteresis: a clearly-better IN-CONE challenger steals the lock once the cooldown has
             # elapsed -- OR immediately if we're only APPROACHING (matched is still off-cone): a far target
             # we're merely panning toward must not earn hysteresis protection against a target in the fire cone.
             if off > self.acquire_fov or self._since_commit >= self.switch_cooldown:
-                best = _argmin_in_cone(dets, frame_w, frame_h, fov_deg, self.acquire_fov, exclude=matched)
-                if best is not None and (_sel_cost(best, frame_w, frame_h, fov_deg) + self.switch_margin
-                                         < _sel_cost(matched, frame_w, frame_h, fov_deg)):
-                    self.engaging = True
-                    return self._commit(best)
+                best = _argmin_in_prep(prep, self.acquire_fov, exclude=matched)
+                if best is not None:
+                    # find best's cached cost in one pass (small N, negligible) and compare
+                    best_cost = next(t[4] for t in prep if t[0] is best)
+                    matched_cost = matched_tuple[4]
+                    if best_cost + self.switch_margin < matched_cost:
+                        self.engaging = True
+                        return self._commit(best)
             # stay on the committed target; fire-ready only while it is inside the fire cone
             self.engaging = off <= self.acquire_fov
             return self._lock(matched)
@@ -275,4 +316,4 @@ class TargetTracker:
         # gone long enough -> drop and re-acquire (in-cone engage, else approach the other side)
         self._last = None
         self._missing = 0
-        return self._acquire_or_approach(dets, frame_w, frame_h, fov_deg)
+        return self._acquire_or_approach(prep)

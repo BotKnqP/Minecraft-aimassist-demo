@@ -14,6 +14,10 @@ public final class RecorderConfig {
 
     // --- runtime bridge ---
     public int runtimePort = 5555;                   // localhost TCP port for the Python client
+    public boolean runtimeRawFrame = true;           // send raw BGR pixels instead of PNG (skips the slow
+                                                     // PNG encode on the render thread; Python sniffs 'R' vs
+                                                     // PNG magic so legacy peers still work). Toggle false to
+                                                     // force PNG if a peer can't handle raw.
     public int runtimeCaptureInterval = 4;           // capture/send every N client ticks (raise if laggy).
                                                      // ~4 (5 Hz) matches CPU YOLO throughput so frames don't
                                                      // pile up (less game lag + less latency -> less overshoot).

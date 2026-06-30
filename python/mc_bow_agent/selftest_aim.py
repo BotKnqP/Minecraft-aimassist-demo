@@ -3,7 +3,8 @@
   python -m mc_bow_agent.selftest_aim
 """
 from .aim import (Detection, pick_nearest, focal_px, bearing_from_bbox,
-                  range_from_bbox_height, aim_at, solve_from_detections, TargetTracker)
+                  range_from_bbox_height, aim_at, solve_from_detections, TargetTracker,
+                  _prep_bearings, _argmin_in_prep, _argmin_in_cone, _sel_cost, _ang_off)
 
 
 def approx(a, b, t=1e-6):
@@ -147,6 +148,35 @@ def test_tracker_identity_gate_rejects_bigger_box():
     assert tk.select([A], W, H, fov) is A
     C = Detection.from_xyxy(260, 120, 380, 240, 0.9)       # same centre, area=14400 (9x) -> different mob
     assert tk.select([C], W, H, fov) is None               # size gate rejects -> treated as missing, not 'still A'
+
+
+def test_prep_bearings_matches_old_helpers():
+    """The cached _prep_bearings + _argmin_in_prep MUST yield byte-identical results to the legacy
+    per-detection _ang_off/_sel_cost/_argmin_in_cone helpers on a synthetic 20-box frame, otherwise the
+    target selection has subtly drifted."""
+    W, H, fov = 640, 360, 70.0
+    # Deterministic grid of 20 boxes, varying sizes and positions to exercise both cone-edge and centre cases.
+    dets = []
+    for i, (x, y, s, c) in enumerate([
+        (100, 100, 30, 0.95), (200, 110, 28, 0.88), (300, 95, 35, 0.91), (400, 140, 50, 0.99),
+        (500, 200, 40, 0.62), (560, 180, 25, 0.74), (320, 180, 60, 0.83), (320, 240, 38, 0.71),
+        (60, 280, 22, 0.55),  (80, 60, 18, 0.45),   (250, 60, 36, 0.66), (450, 60, 33, 0.59),
+        (520, 300, 26, 0.81), (180, 320, 31, 0.86), (380, 300, 29, 0.92), (610, 140, 24, 0.51),
+        (10, 200, 20, 0.50),  (300, 320, 44, 0.77), (330, 200, 30, 0.69), (290, 175, 45, 0.95),
+    ]):
+        dets.append(Detection.from_xyxy(x - s // 2, y - s // 2, x + s // 2, y + s // 2, c))
+    prep = _prep_bearings(dets, W, H, fov)
+    # the cached d_yaw/d_pitch/ang_off MUST equal the per-call computations
+    for (d, dy, dp, ang, cost) in prep:
+        old_dy, old_dp = bearing_from_bbox(d.cx, d.cy, W, H, fov)
+        assert approx(dy, old_dy, 1e-9) and approx(dp, old_dp, 1e-9)
+        assert approx(ang, _ang_off(d, W, H, fov), 1e-9)
+        assert approx(cost, _sel_cost(d, W, H, fov), 1e-9)
+    # and the in-cone argmin must match the legacy path's pick across several cone sizes
+    for cone in (10.0, 25.0, 40.0, 90.0, 180.0):
+        a = _argmin_in_prep(prep, cone)
+        b = _argmin_in_cone(dets, W, H, fov, cone)
+        assert a is b, f"cone={cone}: cached pick {a} vs legacy {b}"
 
 
 def main():
