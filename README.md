@@ -11,6 +11,8 @@ It sees zombies in the rendered frame with YOLO, leads + drop-compensates the sh
 
 [English](#english) · [中文](#中文)
 
+`git clone https://github.com/BotKnqP/MC_visi0n_aim`
+
 </div>
 
 > ⚠️ **Research / single-player only.** This drives the local client by reading the rendered screen and synthesizing keyboard/mouse input. Do **not** use it on public/multiplayer servers. 仅供单机研究,**请勿用于联机/公共服务器作弊**。
@@ -21,7 +23,7 @@ It sees zombies in the rendered frame with YOLO, leads + drop-compensates the sh
 
 ### What it is
 
-`mc-bow-agent` plays a horde-survival bow scenario in Minecraft **entirely from pixels**. At runtime it never reads entity coordinates from the game — a YOLO detector finds zombies in the rendered frame, the agent picks the nearest one, computes where to aim (screen bearing + range from the box size + Minecraft's exact arrow ballistics), and a small Fabric mod turns the view and looses the arrow.
+This agent plays a horde-survival bow scenario in Minecraft **entirely from pixels**. At runtime it never reads entity coordinates from the game — a YOLO detector finds zombies in the rendered frame, the agent picks the nearest one, computes where to aim (screen bearing + range from the box size + Minecraft's exact arrow ballistics), and a small Fabric mod turns the view and looses the arrow.
 
 Getting the detector is a self-contained loop: a Fabric mod records gameplay and **auto-labels it for free** (it projects each mob's true bounding box to the screen), so you train a zombie detector on your own footage with zero hand-labelling.
 
@@ -116,10 +118,12 @@ python -m mc_bow_agent.runtime_loop --weights runs/detect/mcbow_zombie_v2/weight
 ```
 The boxes show **in-game** (toggle F9). Add `--show` for a separate OpenCV debug window; pass `--imgsz 320/416` to override the auto size.
 
+> **Weights aren't committed** (`*.pt/*.onnx` are git-ignored). Either train your own (steps above), or grab a pretrained `best.onnx` from the [Releases](../../releases) and point `--weights` at it.
+
 ### Project layout
 
 ```
-mc-bow-agent/
+MC_visi0n_aim/
 ├─ python/mc_bow_agent/
 │  ├─ runtime_loop.py · protocol.py · runtime.py   # live loop + socket + YOLO wrapper
 │  ├─ aim.py · ballistic.py · calibrate.py          # target commit, drop solve, range fit
@@ -143,7 +147,7 @@ mc-bow-agent/
 
 ### 这是什么
 
-`mc-bow-agent` 在 Minecraft 里玩"波次生存弓箭战斗",**完全靠画面像素**。运行时它**不读取游戏里的实体坐标**——YOLO 检测器从渲染画面里认出僵尸,智能体选最近的一只,算出该往哪瞄(屏幕方位 + 由框大小估的距离 + Minecraft 精确箭矢弹道),再由一个 Fabric mod 转动视角、把箭射出去。
+本智能体在 Minecraft 里玩"波次生存弓箭战斗",**完全靠画面像素**。运行时它**不读取游戏里的实体坐标**——YOLO 检测器从渲染画面里认出僵尸,智能体选最近的一只,算出该往哪瞄(屏幕方位 + 由框大小估的距离 + Minecraft 精确箭矢弹道),再由一个 Fabric mod 转动视角、把箭射出去。
 
 检测器是自给自足练出来的:Fabric mod 一边录制一边**免费自动打标**(把每只怪的真实包围盒投影到屏幕),所以你用自己的录像训一个僵尸检测器,**零手工标注**。
 
@@ -238,10 +242,12 @@ python -m mc_bow_agent.runtime_loop --weights runs/detect/mcbow_zombie_v2/weight
 ```
 识别框直接画在**游戏画面**里(F9 开关)。想要独立 OpenCV 调试窗口就加 `--show`;`--imgsz 320/416` 可覆盖自动尺寸。
 
+> **权重不进库**(`*.pt/*.onnx` 已忽略)。要么自己训(上面步骤),要么去 [Releases](../../releases) 下载预训练的 `best.onnx`,把 `--weights` 指过去即可。
+
 ### 目录结构
 
 ```
-mc-bow-agent/
+MC_visi0n_aim/
 ├─ python/mc_bow_agent/
 │  ├─ runtime_loop.py · protocol.py · runtime.py   # 实时循环 + socket + YOLO 封装
 │  ├─ aim.py · ballistic.py · calibrate.py          # 目标锁定、落点解算、测距拟合
