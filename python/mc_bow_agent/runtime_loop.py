@@ -301,11 +301,13 @@ def main(argv=None):
     ap.add_argument("--conf", type=float, default=0.25,
                     help="detection confidence; 0.25 catches far more zombies (the detector is "
                          "weak ~0.39 mAP); raise it if the bot fires at false positives")
-    ap.add_argument("--fire-conf", type=float, default=0.55,
-                    help="INDEPENDENT confidence floor before fire_ok is allowed (gates ONLY firing, "
-                         "not detection/tracking). Keep --conf low so the bot still SEES distant zombies, "
-                         "but set this 0.55-0.7 so it only shoots when the tracked target is a strong "
-                         "detection. Set 0 to disable the gate.")
+    ap.add_argument("--fire-conf", type=float, default=0.0,
+                    help="OPTIONAL confidence floor before fire_ok is allowed (independent of --conf, "
+                         "which gates detection). Default 0 = off — DON'T enable casually: far zombies "
+                         "have small bboxes -> naturally low conf, and the ballistic solver already "
+                         "blocks fire_ok when range > max_range, so adding a conf gate just kills "
+                         "legit far shots that are 'out of range = no, just small'. Only raise this "
+                         "(0.5-0.7) if you're seeing the bot waste arrows on confirmed false positives.")
     ap.add_argument("--device", default="cpu",
                     help="'cpu' recommended for the LIVE run (Minecraft already holds the GPU; "
                          "a CUDA context here fights it for VRAM/commit). 'cuda:0' only if you "
