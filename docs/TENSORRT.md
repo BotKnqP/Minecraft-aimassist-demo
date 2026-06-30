@@ -14,30 +14,59 @@ You can run either path WITHOUT changing the rest of the pipeline — `make_dete
 
 ---
 
-## Path A — onnxruntime-gpu (CUDA EP)
+## Path A — onnxruntime-gpu (CUDA / TensorRT EP)
 
-Replaces the DirectML EP with the CUDA EP. Same .onnx file, just a faster runtime.
+Replaces the DirectML EP with CUDA + (bundled) TensorRT. Same .onnx file, faster runtime.
 
-**Prereqs**: NVIDIA driver (already installed if `nvidia-smi` works) + CUDA + matching cuDNN.
+### ⚠️ Version matrix (read this before installing)
+
+`pip install onnxruntime-gpu` (no version pin) gets the LATEST, which currently demands
+**CUDA 13.x + cuDNN 9.x** — most users on CUDA 11/12 will fall straight back to CPU and get
+~7 fps instead of 30+. Pick the version that matches your toolkit:
+
+| Your CUDA | Install command | Needs cuDNN |
+|---|---|---|
+| **12.x** (most current installs) | `pip install onnxruntime-gpu==1.19.2` | cuDNN **8.9** for CUDA 12 |
+| **11.8** | `pip install onnxruntime-gpu==1.18.1` | cuDNN **8.9** for CUDA 11 |
+| **13.x** (new install) | `pip install onnxruntime-gpu` (latest) | cuDNN **9.x** |
+
+Check yours: `nvcc --version`. **Driver version (from `nvidia-smi`) is NOT the toolkit version** —
+nvidia-smi reports the driver-supported CUDA, not what's actually installed.
+
+### Install
 
 ```powershell
 # remove DirectML build (the two packages can't coexist cleanly)
 pip uninstall -y onnxruntime-directml onnxruntime
-# install the CUDA build
-pip install onnxruntime-gpu
+# install the CUDA build matching your toolkit (CUDA 12.x example)
+pip install onnxruntime-gpu==1.19.2
+# install cuDNN via pip wheel (avoids the NVIDIA developer-site download dance)
+pip install nvidia-cudnn-cu12
 # verify
 python -c "import onnxruntime as ort; print(ort.get_available_providers())"
-# expected: ['CUDAExecutionProvider', 'CPUExecutionProvider']
+# expected: ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+# OR (if no TRT EP):  ['CUDAExecutionProvider', 'CPUExecutionProvider']
 ```
 
-If you see `CUDAExecutionProvider` in the list, you're done. Run the agent:
+If you see CUDA (or TRT) in the list, you're set. Run the agent:
 ```powershell
 python -m mc_bow_agent.runtime_loop --weights runs/.../best.onnx --device cuda:0
 ```
-`OrtDetector` will print `providers=['CUDAExecutionProvider', ...]` — that's the cue.
+`OrtDetector` will print the providers it actually chose. If you get
+`providers=['CPUExecutionProvider']` instead, the GPU EPs failed to load — go back to DML:
+```powershell
+pip uninstall -y onnxruntime-gpu
+pip install onnxruntime-directml
+```
 
-**Troubleshooting**: if the provider falls back to CPU at runtime, you're missing cuDNN.
-Install the cuDNN matching your CUDA version (NVIDIA developer site) or stick with DML.
+### Troubleshooting
+
+- **`Error 126: ...nvinfer_xx.dll missing`** — TensorRT runtime DLLs not on PATH. Either install the
+  full TensorRT SDK (Path B below) or stick with the CUDA EP (still ~1.5× DML).
+- **`Require cuDNN 9.* and CUDA 13.*`** — you installed too-new onnxruntime-gpu. Downgrade per the
+  table above.
+- **`Failed to create CUDAExecutionProvider`** — CUDA toolkit + cuDNN aren't both on PATH. If you
+  `pip install nvidia-cudnn-cu12`, add `D:\Python\Lib\site-packages\nvidia\cudnn\bin` to PATH.
 
 ---
 
