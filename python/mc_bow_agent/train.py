@@ -66,12 +66,15 @@ def main(argv=None):
     metrics = model.val()
     print("val:", metrics)
     if a.export != "none":
+        # dynamic=True so the runtime OrtDetector can pick the inference imgsz (e.g. 416 for speed,
+        # 640 for accuracy) without re-exporting. Fixed-shape was a footgun upstream — locked you into
+        # whatever imgsz you happened to pass to train.
         try:
-            out = model.export(format=a.export, imgsz=a.imgsz, opset=12, simplify=True, dynamic=False)
+            out = model.export(format=a.export, imgsz=a.imgsz, opset=12, simplify=True, dynamic=True)
         except Exception as e:
             print(f"export with simplify failed ({e}); retrying without simplify...")
             try:
-                out = model.export(format=a.export, imgsz=a.imgsz, opset=12, simplify=False, dynamic=False)
+                out = model.export(format=a.export, imgsz=a.imgsz, opset=12, simplify=False, dynamic=True)
             except Exception as e2:
                 raise SystemExit(f"ONNX export failed: {e2}\n"
                                  "Install export deps:  pip install onnx onnxslim onnxruntime")
