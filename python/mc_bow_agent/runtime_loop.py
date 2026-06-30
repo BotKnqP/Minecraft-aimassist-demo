@@ -27,7 +27,8 @@ if _platform.system() == "Linux":
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from . import protocol as P
-from .aim import APPROACH_STEP_DEG, TargetTracker, aim_at
+from .aim import APPROACH_STEP_DEG, TargetTracker, aim_at, aim_from_bearing, bearing_from_bbox
+from .bearing_tracker import TargetState
 from .detect_tracker import DetectionSmoother
 from .runtime import DEFAULT_FOV, DEFAULT_K
 
@@ -143,68 +144,122 @@ class _LatestFrameRecv:
 
 def run_client(detector, sock, k=DEFAULT_K, fov=DEFAULT_FOV, conf=0.5,
                max_frames=None, on_step=None, debug=False, show=False, tracker=None,
-               smoother=None):
-    """Drive the pipelined loop on an open socket. The mod streams frames as soon as they're available;
-    a background recv thread keeps only the LATEST one for us so detection wall-clock no longer caps
-    capture rate. `detector` is any object with detect(frame)->(detections, shape). Returns
-    (frames, targets). Raises on a socket abort/reset (caught by the caller's reconnect loop)."""
+               smoother=None, send_hz=20.0, predict_ms=300):
+    """v0.4 async loop. Detection runs whenever a fresh frame arrives (10 Hz given the mod's
+    capture interval); the SENDER ticks at `send_hz` (20 Hz) and emits the LATEST predicted
+    bearing from TargetState every send. Between detections the bearing is decayed by the
+    expected mod turn (gain + deadzone + clamp) so we don't overshoot. This turns the old
+    'detect -> send -> wait' lock-step into 'detect on its own clock, send on its own clock'
+    — control rate is no longer capped by detection rate. Lost-target grace = `predict_ms`."""
     if tracker is None:
         tracker = TargetTracker()
     recv = _LatestFrameRecv(sock)
-    frames = targets = 0
-    while max_frames is None or frames < max_frames:
-        png, eof = recv.take(timeout=2.0)
+    state = TargetState(max_predict_ms=int(predict_ms))
+    send_interval = 1.0 / float(send_hz)
+
+    # cached frame-shape (only set after the first decoded frame)
+    last_w = last_h = None
+    # cached for the ESP overlay between detection frames -- so the boxes don't all vanish
+    # on a tick where no fresh detection arrived
+    last_boxes = []
+    last_engaging = False
+
+    last_send = 0.0
+    frames = sends = targets = 0
+    last_target_id = None
+
+    while max_frames is None or sends < max_frames:
+        # Wait either for a new frame OR up to one send interval (whichever comes first)
+        slice_s = max(0.001, send_interval - (time.monotonic() - last_send))
+        png, eof = recv.take(timeout=slice_s)
         if eof:
-            break                             # mod closed the connection
-        if png is None:
-            continue                          # watchdog timeout, keep waiting
-        if debug:
-            print(f"[recv] frame_seq={frames} bytes={len(png)} dropped={recv.dropped()}")
+            break
 
-        # Perception/aim is wrapped: a transient inference hiccup (e.g. cv2/torch OOM when
-        # commit memory spikes) must NOT crash the program. On error we skip the frame and
-        # still reply with a safe 'no target' so the mod's lock-step read doesn't hang.
-        frame = None
-        dets, target, sol = [], None, None
-        try:
-            frame = P.decode_frame(png)
-            if frame is not None:
-                h, w = frame.shape[:2]
-                dets = detector.detect(frame)[0]
-                if smoother is not None:
-                    dets = smoother.update(dets)      # frame-to-frame stabilisation (kills flicker)
-                target = tracker.select(dets, w, h, fov)  # aimbot lock: crosshair-nearest in FOV cone
-                sol = aim_at(target, w, h, fov, k=k) if target is not None else None
-                if sol is not None and not tracker.engaging:
-                    # approaching an OFF-cone target ("look to the other side"): pan gently toward it and
-                    # HOLD fire until it enters the cone (engaging) and the mod aligns within ~2 deg.
-                    s = APPROACH_STEP_DEG
-                    sol = replace(sol, fireable=False,
-                                  d_yaw=max(-s, min(s, sol.d_yaw)),
-                                  d_pitch=max(-s, min(s, sol.d_pitch)))
-        except Exception as e:
-            print(f"[frame {frames}] inference skipped ({type(e).__name__}: {e})")
-            dets, target, sol = [], None, None
-
-        action = aim_to_action(sol, n_det=len(dets))
-        action["boxes"] = boxes_payload(dets, target, getattr(tracker, "engaging", False))
-        # binary encoding: ~3-5x faster to parse on the mod side and no per-frame JsonObject/String allocations
-        # (the mod sniffs the leading byte, so a binary payload is auto-routed). Magic 'A' vs JSON '{'.
-        P.send_msg(sock, P.encode_action_bin(action))   # socket error -> propagate -> reconnect
-        if debug:
-            print(f"[send] d_yaw={action['d_yaw']} d_pitch={action['d_pitch']} "
-                  f"range={action['range']} fire_ok={action['fire_ok']}")
-        if show and frame is not None:
+        # 1) DETECTION LEG -- only fires when a fresh frame arrived
+        if png is not None:
+            frame = None
+            dets = []
+            target = None
             try:
-                _show_detections(frame, dets, target, sol)
-            except Exception:
-                pass   # a display error must never crash/exit the control loop
-        frames += 1
+                frame = P.decode_frame(png)
+                if frame is not None:
+                    last_h, last_w = frame.shape[:2]
+                    dets = detector.detect(frame)[0]
+                    if smoother is not None:
+                        dets = smoother.update(dets)
+                    target = tracker.select(dets, last_w, last_h, fov)
+                    # update the high-freq bearing state ONLY from in-cone (engaging) detections;
+                    # an approach target is "turn toward this off-cone box" not "shoot here yet"
+                    if target is not None and tracker.engaging:
+                        dy, dp = bearing_from_bbox(target.cx, target.cy, last_w, last_h, fov)
+                        now_ms = time.monotonic() * 1000.0
+                        state.on_measurement(dy, dp, target.h, target.w, target.conf, now_ms)
+                    elif target is None or not tracker.engaging:
+                        # losing the engage target: let TargetState's predict_ms grace decide when
+                        # to actually drop. Don't snap-reset here -- a 1-frame detection miss in
+                        # the middle of a shot must not zero the bearing.
+                        pass
+                    last_engaging = bool(target is not None and tracker.engaging)
+                    last_boxes = boxes_payload(dets, target, last_engaging)
+                if debug:
+                    print(f"[recv] frame#{frames} bytes={len(png)} det={len(dets)} "
+                          f"target={target is not None} engaging={last_engaging}")
+            except Exception as e:
+                print(f"[frame {frames}] inference skipped ({type(e).__name__}: {e})")
+            if show and frame is not None:
+                try:
+                    _show_detections(frame, dets, target, None)
+                except Exception:
+                    pass
+            frames += 1
+
+        # 2) CONTROL LEG -- runs at send_hz regardless of frame arrival
+        now = time.monotonic()
+        if now - last_send < send_interval:
+            continue
+        last_send = now
+        now_ms = now * 1000.0
+
+        sol = None
+        approach_target_in_dets = None     # if not engaging, we may still want to pan toward an approach target
+        if state.has_target(now_ms) and last_w is not None and last_h is not None:
+            dy, dp, h_px, w_px, c = state.current_bearing()
+            sol = aim_from_bearing(dy, dp, h_px, k=k, frame_h=last_h, fov_deg=fov)
+            # account for the turn the mod is about to make from THIS action: subtract the
+            # expected actual movement (mirrored gain + clamp + deadzone) from our held bearing
+            state.on_send(sol.d_yaw, sol.d_pitch)
+        # ESP overlay & "look to the other side" pan only matter when we have NO engage target
+        # AND there's a current TargetTracker approach selection -- handled inside the detection
+        # leg above by simply not updating state. If the tracker holds an approach selection on
+        # the most recent frame, fall back to the old per-frame approach output:
+        if sol is None and tracker._last is not None and not tracker.engaging and last_w is not None:
+            # build a one-shot approach solution from the tracker's last detection (no
+            # TargetState involvement -- approach is intentionally low-precision)
+            t = tracker._last
+            from .aim import aim_at as _aim_at_now
+            sol_app = _aim_at_now(t, last_w, last_h, fov, k=k)
+            s = APPROACH_STEP_DEG
+            sol = replace(sol_app, fireable=False,
+                          d_yaw=max(-s, min(s, sol_app.d_yaw)),
+                          d_pitch=max(-s, min(s, sol_app.d_pitch)))
+
+        action = aim_to_action(sol, n_det=len(last_boxes))
+        action["boxes"] = last_boxes
+        try:
+            P.send_msg(sock, P.encode_action_bin(action))
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            raise            # surfaces to main()'s reconnect loop
+        sends += 1
         targets += 1 if sol is not None else 0
+        if debug:
+            age = int(state.age_ms(now_ms)) if state.has_target(now_ms) else -1
+            print(f"[send#{sends}] d_yaw={action['d_yaw']} d_pitch={action['d_pitch']} "
+                  f"range={action['range']} fire={action['fire_ok']} age={age}ms")
         if on_step is not None:
-            on_step(frames, len(dets), sol, action)
+            on_step(sends, len(last_boxes), sol, action)
+
     recv.close()
-    return frames, targets
+    return sends, targets
 
 
 def main(argv=None):
@@ -226,6 +281,14 @@ def main(argv=None):
                          "640 only upsamples height with no extra signal) / 320 on CPU (speed). Pass 640 to "
                          "match the trained size on a beefy GPU, or 256 for the lightest CPU runs.")
     # Frame-to-frame detection smoother — cheap remedy for the weak detector's flicker on far targets.
+    # v0.4 async-tracker knobs: control rate is decoupled from detection rate.
+    ap.add_argument("--send-hz", type=float, default=20.0,
+                    help="rate at which Python emits actions (Hz). Decoupled from detection rate, so "
+                         "even at 10 fps detection the mod gets a fresh predicted action every 50 ms. "
+                         "Cap is the mod's tick rate (20 Hz); going higher just wastes packets.")
+    ap.add_argument("--predict-ms", type=int, default=300,
+                    help="how long TargetState holds a target after the last fresh detection (ms). "
+                         "Beyond this the target is dropped and the bow stops. Default 300 ms.")
     ap.add_argument("--no-smooth", action="store_true",
                     help="disable the IoU-tracker detection smoother (default ON). The smoother holds a "
                          "missing detection alive for --smooth-miss frames and EMA-smooths the box.")
@@ -300,7 +363,8 @@ def main(argv=None):
             t0[0] = time.time()
             try:
                 run_client(detector, sock, k=a.k, fov=a.fov, conf=a.conf,
-                           on_step=status, debug=a.debug_protocol, show=a.show, smoother=smoother)
+                           on_step=status, debug=a.debug_protocol, show=a.show, smoother=smoother,
+                           send_hz=a.send_hz, predict_ms=a.predict_ms)
                 print("mod disconnected; reconnecting ...")
             except Exception as e:           # ANY error -> reconnect, never crash (Ctrl-C still exits)
                 print(f"disconnected ({type(e).__name__}: {e}); reconnecting ...")

@@ -41,7 +41,10 @@ import net.minecraft.text.LiteralText;
 public final class RuntimeBridge {
 
     private static final Logger LOGGER = LogManager.getLogger("mcbowagent");
-    private static final long STALE_MS = 200;          // action older than this -> neutral
+    private static final long STALE_MS = 350;          // action older than this -> neutral. Python's
+                                                       // bearing tracker holds for ~300ms after the last
+                                                       // detection; pad slightly so a momentary GPU stall
+                                                       // doesn't kick the mod into neutral inside that window.
     private static final long GRACE_MS = 500;          // keep the bow drawn this long after losing a target
     private static final int READ_TIMEOUT_MS = 0;      // 0 = infinite: do NOT auto-drop the client on
                                                        // a slow reply (cancelled per request). A closed/

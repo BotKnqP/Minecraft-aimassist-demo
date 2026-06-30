@@ -97,6 +97,17 @@ def range_from_bbox_height(bbox_h, frame_h=None, fov_deg=None, mob_height=ZOMBIE
     return focal_px(frame_h, fov_deg) * mob_height / bbox_h
 
 
+def aim_from_bearing(d_yaw: float, d_pitch: float, bbox_h: float, k=None,
+                     max_range: float = 40.0, frame_h: float = None, fov_deg: float = None) -> AimSolution:
+    """Build an AimSolution directly from a precomputed bearing (deg) + bbox height (px). Used by
+    the high-freq sender in run_client, where the target's bearing is held + decayed by TargetState
+    between detection frames so we don't have a fresh Detection every send."""
+    rng = range_from_bbox_height(bbox_h, frame_h, fov_deg, k=k) if bbox_h > 0 else float("inf")
+    drop = abs(solve_pitch(BOW_FULL_CHARGE_SPEED, max(rng if math.isfinite(rng) else max_range, 0.5), 0.0))
+    return AimSolution(d_yaw=d_yaw, d_pitch=d_pitch - drop, range_blocks=rng,
+                       drop_deg=drop, fireable=math.isfinite(rng) and rng <= max_range)
+
+
 def aim_at(det: Detection, frame_w, frame_h, fov_deg, k=None, max_range=40.0) -> AimSolution:
     """Aim solution for one detection: centre on it, then raise for arrow drop.
 
