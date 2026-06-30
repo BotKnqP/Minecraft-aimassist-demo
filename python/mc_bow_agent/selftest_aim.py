@@ -32,6 +32,24 @@ def test_bearing():
     assert y < 0                                                     # left -> negative yaw
 
 
+def test_range_fov_aware_k_rescales_for_user_fov():
+    """The calibration k=244.3 was fit at fov=70°; running at fov=93° must give a SMALLER k_eff so far-
+    target range doesn't overshoot. Specifically k_eff(93) ≈ k * tan(35°)/tan(46.5°) ≈ 0.665 * k.
+    Without this rescaling the user's fov=93 sessions over-estimate range by ~50% on distant zombies
+    and the arrow falls short."""
+    from .aim import range_from_bbox_height, CAL_FOV_DEG
+    import math as _m
+    k = 244.3
+    h = 60        # bbox height in px
+    # AT the calibration FOV: rescaling is a no-op (exactly k / h)
+    assert approx(range_from_bbox_height(h, fov_deg=CAL_FOV_DEG, k=k), k / h, 1e-9)
+    # At 93°: rescaled
+    expected = (k * _m.tan(_m.radians(35.0)) / _m.tan(_m.radians(46.5))) / h
+    assert approx(range_from_bbox_height(h, fov_deg=93.0, k=k), expected, 1e-9)
+    # fov_deg=None ⇒ no rescale (legacy behaviour)
+    assert approx(range_from_bbox_height(h, fov_deg=None, k=k), k / h, 1e-9)
+
+
 def test_range():
     assert approx(range_from_bbox_height(100, k=5000.0), 50.0)
     assert approx(range_from_bbox_height(250, k=5000.0), 20.0)

@@ -1,0 +1,11 @@
+accessWidener	v1	named
+
+# Expose GameRenderer.getFov so FrameCapture/HudBboxRenderer can read the EXACT FOV the projection
+# matrix used for this render frame (user runs FOV 93, not the hard-coded 70). Yarn 1.16.5 marks
+# this private; widening to public on this JVM only — no game behaviour change.
+accessible	method	net/minecraft/client/render/GameRenderer	getFov	(Lnet/minecraft/client/render/Camera;FZ)D
+
+# Expose NativeImage.pointer so FrameCapture can swizzle ABGR -> BGR via a single MemoryUtil bulk-read
+# instead of 100k JNI calls to getPixelColor per frame. Required for the v0.7.0 60Hz capture path —
+# at 60 Hz the per-pixel loop would consume ~35% of the render thread budget.
+accessible	field	net/minecraft/client/texture/NativeImage	pointer	J

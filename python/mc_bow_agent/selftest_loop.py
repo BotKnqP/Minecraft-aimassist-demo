@@ -35,6 +35,28 @@ def test_protocol_raw_frame_roundtrip():
     assert meta == {}
 
 
+def test_protocol_raw_w_frame_carries_fov():
+    """The current 'W' raw frame ships capture_ms AND the FOV the projection matrix used. Python uses
+    the per-frame FOV (not a hard-coded 70) so a user running 93° gets correct bearings + range."""
+    import numpy as np
+    W, H = 5, 7
+    cap_ms = 1234567890
+    fov_x100 = 9300                                    # 93.00°
+    rng = np.arange(H * W * 3, dtype=np.uint8).reshape(H, W, 3)
+    hdr = bytes([ord('W'), (W >> 8) & 0xff, W & 0xff, (H >> 8) & 0xff, H & 0xff])
+    cap = cap_ms.to_bytes(8, "big")
+    fov = fov_x100.to_bytes(2, "big")
+    payload = hdr + cap + fov + rng.tobytes()
+    out, meta = P.decode_frame(payload)
+    assert out.shape == (H, W, 3) and np.array_equal(out, rng)
+    assert meta["capture_ms"] == cap_ms
+    assert approx(meta["fov_deg"], 93.0, 1e-6)
+    # garbage FOV (0 or out of [10, 175]) -> meta omits fov_deg, caller falls back to CLI
+    bad = hdr + cap + (0).to_bytes(2, "big") + rng.tobytes()
+    _, meta_bad = P.decode_frame(bad)
+    assert "fov_deg" not in meta_bad
+
+
 def test_protocol_raw_v_frame_carries_capture_ms():
     """The new 'V' raw-versioned payload carries an 8-byte capture_unix_ms so Python can back-correct
     a measurement by the mod-turn that happened during the inference round-trip."""

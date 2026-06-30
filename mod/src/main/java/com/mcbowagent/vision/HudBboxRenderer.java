@@ -33,11 +33,14 @@ public final class HudBboxRenderer {
         if (boxes == null) return;
         int dxPx = 0, dyPx = 0;
         if (haveCaptureView) {
-            // focal_px from vertical FOV 70° (matches the detector + Python's aim math).
-            // shift sign: yaw RIGHT (currentYaw > captureYaw) means the world appears to move LEFT in
-            // screen coords, so the same target's bbox center has decreased -> we add a NEGATIVE shift.
+            // focal_px from the CURRENT render FOV (whatever the player has set: 70 / 93 / 110...).
+            // Hard-coding 70 used to over-estimate the shift at fov 93 by ~33%, which made boxes visibly
+            // overshoot during pans.
+            double fov = mc.gameRenderer.getFov(mc.gameRenderer.getCamera(), mc.getTickDelta(), true);
             int h = mc.getWindow().getScaledHeight();
-            double focal = (h / 2.0) / Math.tan(Math.toRadians(70.0) / 2.0);
+            double focal = (h / 2.0) / Math.tan(Math.toRadians(fov) / 2.0);
+            // shift sign: yaw RIGHT (currentYaw > captureYaw) means the world appears to move LEFT in
+            // screen coords -> shift the box by a NEGATIVE pixel delta.
             double dy = wrapDeg180(currentYaw - captureYaw);
             double dp = currentPitch - capturePitch;
             dxPx = (int) Math.round(-Math.tan(Math.toRadians(dy)) * focal);

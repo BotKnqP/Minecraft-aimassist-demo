@@ -145,132 +145,142 @@ class _LatestFrameRecv:
 def run_client(detector, sock, k=DEFAULT_K, fov=DEFAULT_FOV, conf=0.5,
                max_frames=None, on_step=None, debug=False, show=False, tracker=None,
                smoother=None, send_hz=20.0, predict_ms=300):
-    """v0.4 async loop. Detection runs whenever a fresh frame arrives (10 Hz given the mod's
-    capture interval); the SENDER ticks at `send_hz` (20 Hz) and emits the LATEST predicted
-    bearing from TargetState every send. Between detections the bearing is decayed by the
-    expected mod turn (gain + deadzone + clamp) so we don't overshoot. This turns the old
-    'detect -> send -> wait' lock-step into 'detect on its own clock, send on its own clock'
-    — control rate is no longer capped by detection rate. Lost-target grace = `predict_ms`."""
+    """v0.7 three-thread loop:
+      recv-thread:  socket  -> latest-frame slot (always 1, latest-wins)
+      detect-thread: latest-frame slot -> detector.detect -> tracker.select -> TargetState
+      MAIN (send):   timer at `send_hz` -> TargetState.current_bearing -> aim -> socket
+
+    The detect thread isolates the ~3 ms (TRT) / ~50 ms (CPU) inference from the main loop, so
+    sends keep ticking at a stable `send_hz` even when inference takes longer than `send_interval`.
+    At the mod's new 60 Hz capture rate the detector will process whichever frame is the latest
+    each time it finishes — the recv slot drops everything in between (latest-wins). Lost-target
+    grace remains `predict_ms`.
+
+    Shared state (TargetState + last_* shared dict) is guarded by one lock; hold time is microseconds
+    vs ms of inference, so contention is irrelevant. ORT InferenceSession is safely re-entrant from a
+    single dedicated thread (we never share it across threads — main never calls detect)."""
     if tracker is None:
         tracker = TargetTracker()
     recv = _LatestFrameRecv(sock)
     state = TargetState(max_predict_ms=int(predict_ms))
     send_interval = 1.0 / float(send_hz)
 
-    # cached frame-shape (only set after the first decoded frame)
-    last_w = last_h = None
-    # cached for the ESP overlay between detection frames -- so the boxes don't all vanish
-    # on a tick where no fresh detection arrived
-    last_boxes = []
-    last_engaging = False
-    last_capture_ms = None        # capture_ms of the last detection frame (passed back to TargetState back-correction)
+    shared_lock = threading.Lock()
+    shared = {
+        "last_w": None, "last_h": None,
+        "last_boxes": [], "engaging": False,
+        "last_capture_ms": None, "last_fov": fov,
+        "frames": 0,                 # frames the detect thread has processed
+        "alive": True,
+    }
 
-    last_send = 0.0
-    frames = sends = targets = 0
-    last_target_id = None
-
-    while max_frames is None or sends < max_frames:
-        # Wait either for a new frame OR up to one send interval (whichever comes first)
-        slice_s = max(0.001, send_interval - (time.monotonic() - last_send))
-        png, eof = recv.take(timeout=slice_s)
-        if eof:
-            break
-
-        # 1) DETECTION LEG -- only fires when a fresh frame arrived.
-        # Rule: TargetState is a PURE FUNCTION of tracker.select on the latest detection. If
-        # tracker returns None (target genuinely gone after kill_patience, OR whole-frame miss
-        # past miss_patience), we RESET state so the control leg doesn't keep aiming at a
-        # ghost. DetectionSmoother + TargetTracker patience already absorb single-frame jitter
-        # below this layer; adding more grace HERE just makes the bot face dead space after a
-        # kill and ignore newly-arrived approach targets on the OTHER side of the screen.
-        if png is not None:
-            frame = None
-            dets = []
-            target = None
-            meta = {}
+    def _detect_loop():
+        local_frames = 0
+        while shared["alive"]:
+            png, eof = recv.take(timeout=0.1)
+            if eof:
+                with shared_lock:
+                    shared["alive"] = False
+                return
+            if png is None:
+                continue
             try:
                 frame, meta = P.decode_frame(png)
-                if frame is not None:
-                    last_h, last_w = frame.shape[:2]
-                    last_capture_ms = meta.get("capture_ms")    # None for legacy 'R' frames
-                    dets = detector.detect(frame)[0]
-                    if smoother is not None:
-                        dets = smoother.update(dets)
-                    target = tracker.select(dets, last_w, last_h, fov)
+                if frame is None:
+                    continue
+                H, W = frame.shape[:2]
+                cap_ms = meta.get("capture_ms")
+                frame_fov = meta.get("fov_deg", fov)
+                dets = detector.detect(frame)[0]
+                if smoother is not None:
+                    dets = smoother.update(dets)
+                target = tracker.select(dets, W, H, frame_fov)
+                now_ms = time.time() * 1000.0
+                with shared_lock:
                     if target is not None:
-                        dy, dp = bearing_from_bbox(target.cx, target.cy, last_w, last_h, fov)
-                        now_ms = time.time() * 1000.0
+                        dy, dp = bearing_from_bbox(target.cx, target.cy, W, H, frame_fov)
                         state.on_measurement(dy, dp, target.h, target.w, target.conf,
-                                             now_ms, capture_ms=last_capture_ms)
-                        last_engaging = bool(tracker.engaging)
+                                             now_ms, capture_ms=cap_ms)
+                        engaging = bool(tracker.engaging)
                     else:
-                        # tracker says "no commit this frame" (lost target, or just outside
-                        # any cone). Drop state immediately — keeping it would mean the next
-                        # 300 ms of control ticks aim at thin air while a real target on the
-                        # other side of the screen gets ignored.
                         state.reset()
-                        last_engaging = False
-                    last_boxes = boxes_payload(dets, target, last_engaging)
+                        engaging = False
+                    shared["last_w"] = W
+                    shared["last_h"] = H
+                    shared["last_capture_ms"] = cap_ms
+                    shared["last_fov"] = frame_fov
+                    shared["engaging"] = engaging
+                    shared["last_boxes"] = boxes_payload(dets, target, engaging)
+                    shared["frames"] += 1
+                local_frames += 1
                 if debug:
-                    age = (time.time() * 1000.0 - last_capture_ms) if last_capture_ms else -1
-                    print(f"[recv] frame#{frames} bytes={len(png)} det={len(dets)} "
-                          f"target={target is not None} engaging={last_engaging} stale_ms={age:.0f}")
+                    age = (time.time() * 1000.0 - cap_ms) if cap_ms else -1
+                    print(f"[det#{local_frames}] bytes={len(png)} det={len(dets)} fov={frame_fov:.1f} "
+                          f"target={target is not None} engaging={engaging} stale_ms={age:.0f}")
+                if show:
+                    try:
+                        _show_detections(frame, dets, target, None)
+                    except Exception:
+                        pass
             except Exception as e:
-                print(f"[frame {frames}] inference skipped ({type(e).__name__}: {e})")
-            if show and frame is not None:
-                try:
-                    _show_detections(frame, dets, target, None)
-                except Exception:
-                    pass
-            frames += 1
+                print(f"[det] inference skipped ({type(e).__name__}: {e})")
 
-        # 2) CONTROL LEG -- runs at send_hz regardless of frame arrival.
-        # state drives EVERYTHING (no fallback to tracker._last — that was the v0.4 bug source:
-        # tracker._last hangs on the just-killed target for 4 frames of kill_patience).
-        now = time.monotonic()
-        if now - last_send < send_interval:
-            continue
-        last_send = now
-        now_ms = now * 1000.0
+    det_thread = threading.Thread(target=_detect_loop, name="mcbow-detect", daemon=True)
+    det_thread.start()
 
-        sol = None
-        if state.has_target(now_ms) and last_w is not None and last_h is not None:
-            dy, dp, h_px, w_px, c = state.current_bearing()
-            sol = aim_from_bearing(dy, dp, h_px, k=k, frame_h=last_h, fov_deg=fov)
-            if not last_engaging:
-                # APPROACH: target is outside the fire cone -> pan gently toward it (clamp to
-                # APPROACH_STEP_DEG so a 45° turn doesn't snap), and hold fire until it enters
-                # the cone (fireable=False).
-                s = APPROACH_STEP_DEG
-                sol = replace(sol, fireable=False,
-                              d_yaw=max(-s, min(s, sol.d_yaw)),
-                              d_pitch=max(-s, min(s, sol.d_pitch)))
-            # account for the turn the mod is about to make. Pass wall-clock ms so the send-
-            # history (used by on_measurement back-correction) is tagged with the SAME clock
-            # the mod stamps frames with.
-            state.on_send(sol.d_yaw, sol.d_pitch, now_ms=time.time() * 1000.0)
+    last_send = time.monotonic()
+    sends = targets = 0
+    try:
+        while max_frames is None or sends < max_frames:
+            # Pure timer-driven sender. Inference latency CANNOT delay this tick.
+            sleep_s = send_interval - (time.monotonic() - last_send)
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+            last_send = time.monotonic()
+            if not shared["alive"]:
+                break
+            now_ms = time.time() * 1000.0
 
-        action = aim_to_action(sol, n_det=len(last_boxes))
-        # ESP boxes go through in CAPTURED-FRAME COORDS untouched. The mod's render thread does the
-        # yaw/pitch delta compensation on EVERY render frame (HudBboxRenderer.renderRuntime), which
-        # tracks the actual zombie even between Python sends — fixes the visible "boxes trail during
-        # fast turns" symptom that a python-side compensation couldn't (it's stale by the time the mod
-        # actually paints the frame).
-        action["boxes"] = last_boxes
-        try:
-            P.send_msg(sock, P.encode_action_bin(action))
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            raise            # surfaces to main()'s reconnect loop
-        sends += 1
-        targets += 1 if sol is not None else 0
-        if debug:
-            age = int(state.age_ms(now_ms)) if state.has_target(now_ms) else -1
-            print(f"[send#{sends}] d_yaw={action['d_yaw']} d_pitch={action['d_pitch']} "
-                  f"range={action['range']} fire={action['fire_ok']} age={age}ms")
-        if on_step is not None:
-            on_step(sends, len(last_boxes), sol, action)
+            with shared_lock:
+                w_, h_ = shared["last_w"], shared["last_h"]
+                engaging = shared["engaging"]
+                fov_now = shared["last_fov"]
+                boxes = list(shared["last_boxes"])
+                has_t = state.has_target(now_ms) and w_ is not None and h_ is not None
+                bearing = state.current_bearing() if has_t else None
 
-    recv.close()
+            sol = None
+            if has_t:
+                dy, dp, h_px, w_px, c = bearing
+                sol = aim_from_bearing(dy, dp, h_px, k=k, frame_h=h_, fov_deg=fov_now)
+                if not engaging:
+                    s = APPROACH_STEP_DEG
+                    sol = replace(sol, fireable=False,
+                                  d_yaw=max(-s, min(s, sol.d_yaw)),
+                                  d_pitch=max(-s, min(s, sol.d_pitch)))
+                with shared_lock:
+                    state.on_send(sol.d_yaw, sol.d_pitch, now_ms=time.time() * 1000.0)
+
+            action = aim_to_action(sol, n_det=len(boxes))
+            action["boxes"] = boxes      # mod-side renderer applies live yaw-delta compensation
+            try:
+                P.send_msg(sock, P.encode_action_bin(action))
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                raise
+            sends += 1
+            targets += 1 if sol is not None else 0
+            if debug:
+                age = int(state.age_ms(now_ms)) if has_t else -1
+                print(f"[send#{sends}] d_yaw={action['d_yaw']} d_pitch={action['d_pitch']} "
+                      f"range={action['range']} fire={action['fire_ok']} age={age}ms "
+                      f"detect_frames={shared['frames']}")
+            if on_step is not None:
+                on_step(sends, len(boxes), sol, action)
+    finally:
+        with shared_lock:
+            shared["alive"] = False
+        recv.close()
+        det_thread.join(timeout=2.0)
     return sends, targets
 
 

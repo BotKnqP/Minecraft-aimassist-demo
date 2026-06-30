@@ -101,16 +101,34 @@ def decode_action(buf: bytes) -> dict:
 def decode_frame(buf: bytes):
     """Decode a frame payload to (HxWx3 BGR ndarray, meta dict).
 
-    Three wire formats, distinguished by the first byte:
-      * 'V' (0x56) — VERSIONED raw BGR, fast path WITH capture timestamp:
+    Wire formats, distinguished by the first byte:
+      * 'W' (0x57) — CURRENT raw BGR with capture_ms + fov:
+          [magic 'W'][W:u16 BE][H:u16 BE][capture_unix_ms:u64 BE][fov_x100:u16 BE][BGR bytes...]
+          meta = {'capture_ms': <int ms>, 'fov_deg': <float deg>}
+      * 'V' (0x56) — LEGACY raw BGR with capture_ms only (no fov):
           [magic 'V'][W:u16 BE][H:u16 BE][capture_unix_ms:u64 BE][BGR bytes...]
-          meta = {'capture_ms': <int>}  (mod's System.currentTimeMillis at GL readback)
-      * 'R' (0x52) — legacy raw BGR (no timestamp): [magic 'R'][W:u16 BE][H:u16 BE][BGR bytes...]
+          meta = {'capture_ms': <int>}
+      * 'R' (0x52) — LEGACY raw BGR (no timestamp, no fov):
           meta = {}
-      * 0x89 — PNG: decoded via cv2.imdecode (or PIL fallback). meta = {}
+      * 0x89 — PNG: cv2.imdecode (or PIL fallback). meta = {}
     """
     import numpy as np
-    if buf and buf[0] == 0x56:                                   # 'V' — versioned raw BGR (+ capture_ms)
+    if buf and buf[0] == 0x57:                                   # 'W' — versioned + fov
+        w = int.from_bytes(buf[1:3], "big")
+        h = int.from_bytes(buf[3:5], "big")
+        cap_ms = int.from_bytes(buf[5:13], "big")
+        fov_x100 = int.from_bytes(buf[13:15], "big")
+        expected = 15 + w * h * 3
+        if len(buf) != expected:
+            raise ValueError(f"raw-w frame size mismatch: header says {w}x{h} (need {expected} bytes), got {len(buf)}")
+        frame = np.frombuffer(buf, dtype=np.uint8, count=w * h * 3, offset=15).reshape(h, w, 3)
+        # validate the fov: 0 = "unknown, fall back"; outside [10, 175] = corrupt header, ignore
+        fov_deg = (fov_x100 / 100.0) if 1000 <= fov_x100 <= 17500 else None
+        meta = {"capture_ms": cap_ms}
+        if fov_deg is not None:
+            meta["fov_deg"] = fov_deg
+        return frame, meta
+    if buf and buf[0] == 0x56:                                   # 'V' — capture_ms only
         w = int.from_bytes(buf[1:3], "big")
         h = int.from_bytes(buf[3:5], "big")
         cap_ms = int.from_bytes(buf[5:13], "big")

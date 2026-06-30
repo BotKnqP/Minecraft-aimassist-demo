@@ -20,6 +20,12 @@ from .constants import BOW_FULL_CHARGE_SPEED
 
 ZOMBIE_HEIGHT = 1.95  # blocks (1.16.5 hitbox)
 
+# The FOV the runtime calibration constant k=244.3 was fit at (calibrate.py was run on recordings made at
+# vanilla 70°). At any other FOV the same bbox height projects DIFFERENTLY (focal_px ∝ 1/tan(fov/2)), so we
+# rescale k at runtime to k_eff = k * tan(CAL_FOV/2) / tan(actual_fov/2). At fov=93 this drops k from 244.3
+# to ~162, fixing the "far-target undershoot" symptom — without re-running calibrate.py.
+CAL_FOV_DEG = 70.0
+
 # --- FPS-aimbot selection / lock tuning ---
 # Real aimbots (CS2_External GetBestTarget, GuidedHacking find_closest_target) lock the target NEAREST
 # THE CROSSHAIR inside an FOV cone — NOT the largest/nearest-in-world box. Picking the biggest box made
@@ -89,10 +95,15 @@ def range_from_bbox_height(bbox_h, frame_h=None, fov_deg=None, mob_height=ZOMBIE
     Single-class makes this clean: a mob of fixed real height H spans
     px = focal * H / distance, so distance = focal * H / px = k / px.
     Prefer a calibrated k (fit from recordings via calibrate.py) over the FOV
-    derivation, since the projection FOV is only approximate."""
+    derivation, since the projection FOV is only approximate.
+
+    FOV-aware: k was fit at CAL_FOV_DEG (70°). At any other FOV the same target's bbox is a
+    different size, so we rescale: k_eff = k * tan(CAL/2) / tan(fov/2)."""
     if bbox_h <= 0:
         return float("inf")
     if k is not None:
+        if fov_deg is not None and abs(fov_deg - CAL_FOV_DEG) > 0.01:
+            k = k * math.tan(math.radians(CAL_FOV_DEG) / 2.0) / math.tan(math.radians(fov_deg) / 2.0)
         return k / bbox_h
     return focal_px(frame_h, fov_deg) * mob_height / bbox_h
 

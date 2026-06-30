@@ -23,12 +23,14 @@ public final class RecorderConfig {
                                                      // + downscale + PNG encode + disk write per saved frame.
                                                      // 10 Hz training data is plenty (the existing dataset is
                                                      // ~10 Hz) and at 20 Hz the render thread chokes.
-    public int runtimeCaptureInterval = 2;           // capture/send every N client ticks (raise if laggy).
-                                                     // ~2 (10 Hz) is the new default now that raw-BGR capture
-                                                     // (no PNG encode) + the pipelined socket let the mod feed
-                                                     // a fast Python detector without bottlenecking it. With a
-                                                     // CPU-only detector at <10 fps this just means dedup will
-                                                     // drop the extra frames cheaply (CRC32 -> no-op).
+    public int runtimeCaptureHz = 60;                // target capture rate (Hz) when the runtime is on. Driven
+                                                     // by the RENDER thread's own clock, not by client tick —
+                                                     // so it can go above the 20 Hz tick rate. Backpressure
+                                                     // (frameToSend != null) prevents pile-up when Python is
+                                                     // slower than this. Lower to 30/20/10 if your GPU can't
+                                                     // sustain the readback cost (~0.5-2 ms per frame).
+    public int runtimeCaptureInterval = 2;           // DEPRECATED legacy: kept as a fallback for the recorder
+                                                     // path (F8); F7 runtime now uses runtimeCaptureHz above.
 
     // --- scan / output ---
     public double scanRadius = 40.0;                 // blocks; only log hostiles within this

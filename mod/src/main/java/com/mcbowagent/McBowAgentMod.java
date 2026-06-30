@@ -58,13 +58,14 @@ public class McBowAgentMod implements ClientModInitializer {
                 // vanilla HUD (train/infer parity) but NOT our boxes (otherwise they feed back into detection).
                 bridge.renderCapture(mc);
                 if (config.hudBboxes) {
-                    // Pass CURRENT player view so the renderer can pixel-shift each box by the yaw/pitch
-                    // delta since capture — kills the "boxes trail during big turns" symptom.
-                    float curYaw   = mc.player.yaw;
-                    float curPitch = mc.player.pitch;
+                    // Use the RENDER camera's yaw/pitch (interpolated to THIS render frame via tickDelta)
+                    // instead of player.yaw (tick-quantised at 20 Hz). At 60-300 fps the difference is up
+                    // to half a tick of lag = up to ~25 px shift at 1080p / fov 70 — visible as "boxes
+                    // can't keep up with the camera at large windows / high res".
+                    net.minecraft.client.render.Camera cam = mc.gameRenderer.getCamera();
                     HudBboxRenderer.renderRuntime(matrices, mc, bridge.getLatestBoxes(),
                             bridge.getCaptureYaw(), bridge.getCapturePitch(),
-                            curYaw, curPitch, bridge.hasCaptureView());
+                            cam.getYaw(), cam.getPitch(), bridge.hasCaptureView());
                 }
                 return;
             }

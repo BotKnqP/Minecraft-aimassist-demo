@@ -12,6 +12,7 @@
     "client": ["com.mcbowagent.McBowAgentMod"]
   },
   "mixins": ["mcbowagent.mixins.json"],
+  "accessWidener": "mcbowagent.accesswidener",
   "depends": {
     "fabricloader": ">=0.14.0",
     "minecraft": "1.16.5",

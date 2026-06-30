@@ -100,7 +100,7 @@ public final class RuntimeBridge {
     private final java.util.zip.CRC32 dedupCrc = new java.util.zip.CRC32();
     private long lastFireableMs = 0;         // main thread only (last time we had a fireable target)
     private int captureFailStreak = 0;       // main thread only (consecutive capture exceptions)
-    private volatile boolean captureRequested = false;  // tick requests; the render thread does the readback
+    private long lastCaptureNs = 0;          // render thread only (last successful capture nanoTime)
     private float homeYaw = 0f;              // the yaw the player faced at F7 (the arena centre)
     private boolean haveHome = false;        // when idle, ease yaw back to homeYaw -> turn to the other side
 
@@ -152,7 +152,7 @@ public final class RuntimeBridge {
         haveLastSentCrc = false;
         lastFireableMs = 0;
         captureFailStreak = 0;
-        captureRequested = false;
+        lastCaptureNs = 0;
         synchronized (frameLock) {
             frameToSend = null;
             frameLock.notifyAll();
@@ -350,12 +350,8 @@ public final class RuntimeBridge {
 
         controlTicks++;
 
-        // Request a capture every N ticks; the actual GL readback happens on the render thread in
-        // renderCapture(), BEFORE our ESP overlay is drawn, so our detection boxes never bake into the
-        // frame the detector sees (which would feed back and corrupt the bbox/range). A failed/missing
-        // capture just means no new frame -> the action goes stale -> the bow is stopped below.
-        int interval = Math.max(1, cfg.runtimeCaptureInterval);
-        if (controlTicks % interval == 0) captureRequested = true;
+        // capture timing is now driven by the RENDER thread in renderCapture(), gated by
+        // cfg.runtimeCaptureHz. controlTick is purely a control consumer.
 
         // Single volatile read -> consistent snapshot (atomic publish).
         RuntimeAction act = latestAction;
@@ -402,10 +398,21 @@ public final class RuntimeBridge {
 
     /** Render-thread hook: if a capture was requested this tick, do the GL readback NOW — called from the HUD
      *  callback BEFORE our ESP overlay is drawn, so the captured frame keeps the vanilla HUD (train/infer
-     *  parity) but NOT our boxes. No-op when idle / no client / nothing requested. */
+     *  parity) but NOT our boxes.
+     *
+     *  Self-gating on cfg.runtimeCaptureHz lets capture rate go above the 20 Hz client tick (the v0.6 ceiling).
+     *  Backpressure: if Python hasn't consumed the previous frame yet (frameToSend != null), we skip — drops
+     *  oldest at the producer side instead of letting captures pile up. */
     public void renderCapture(MinecraftClient mc) {
-        if (!cfg.runtimeActive || client == null || !captureRequested) return;
-        captureRequested = false;
+        if (!cfg.runtimeActive || client == null) return;
+        if (mc.currentScreen != null) return;            // skip pause/menu screens — pointless captures
+        long nowNs = System.nanoTime();
+        int hz = Math.max(1, cfg.runtimeCaptureHz);
+        long minIntervalNs = 1_000_000_000L / hz;
+        if (nowNs - lastCaptureNs < minIntervalNs) return;
+        // backpressure: don't pile up frames Python hasn't picked up
+        synchronized (frameLock) { if (frameToSend != null) return; }
+        lastCaptureNs = nowNs;
         doCapture(mc);
     }
 
@@ -415,9 +422,13 @@ public final class RuntimeBridge {
             int w = mc.getWindow().getScaledWidth();
             int h = mc.getWindow().getScaledHeight();
             trace(v, "[mcbowagent] before capture {}x{}", w, h);
+            // Read the same FOV the projection matrix used for this render frame (BowFovMixin already
+            // suppresses the bow-charge zoom during runtime, so this is effectively just the player's
+            // chosen FOV — 70/93/110 — modulo any other vanilla FOV effects like underwater).
+            double fovDeg = mc.gameRenderer.getFov(mc.gameRenderer.getCamera(), mc.getTickDelta(), true);
             byte[] payload = cfg.runtimeRawFrame
-                    ? frameCapture.captureRawBytes(mc, w, h)   // fast path: raw BGR, no PNG encode
-                    : frameCapture.captureBytes(mc, w, h);     // legacy PNG path (still supported)
+                    ? frameCapture.captureRawBytes(mc, w, h, fovDeg)   // fast path: raw BGR + capture_ms + fov
+                    : frameCapture.captureBytes(mc, w, h);             // legacy PNG path (still supported)
             captureFailStreak = 0;                   // a successful capture clears the failure streak
             if (payload == null) {
                 trace(v, "[mcbowagent] capture returned null (framebuffer not ready?)");
@@ -433,12 +444,13 @@ public final class RuntimeBridge {
             }
             lastSentCrc = crc;
             haveLastSentCrc = true;
-            // Pair the frame with the view it was captured in. Boxes Python returns are in THIS view's
-            // coordinates; the render thread shifts them by (currentYaw - captureYaw)*focal_px every frame.
-            ClientPlayerEntity p = mc.player;
-            if (p != null) {
-                captureYaw = p.yaw;
-                capturePitch = p.pitch;
+            // Pair the frame with the view it was rendered in. Read the RENDER camera (interpolated this
+            // render frame) — NOT player.yaw (tick-quantised at 20 Hz). HudBboxRenderer reads from the
+            // same source, so capture-latch and render-shift agree to the exact half-pixel.
+            net.minecraft.client.render.Camera cam = mc.gameRenderer.getCamera();
+            if (cam != null) {
+                captureYaw = cam.getYaw();
+                capturePitch = cam.getPitch();
                 haveCaptureView = true;
             }
             trace(v, "[mcbowagent] capture success: bytes={} {}x{} fmt={}",
