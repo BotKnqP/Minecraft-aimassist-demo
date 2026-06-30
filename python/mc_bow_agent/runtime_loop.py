@@ -254,18 +254,12 @@ def run_client(detector, sock, k=DEFAULT_K, fov=DEFAULT_FOV, conf=0.5,
             state.on_send(sol.d_yaw, sol.d_pitch, now_ms=time.time() * 1000.0)
 
         action = aim_to_action(sol, n_det=len(last_boxes))
-        # ESP drift compensation: the boxes we have are from the LAST captured frame; since then the
-        # mod has been turning. Shift every box by the cumulative expected mod-turn since capture so
-        # the in-game overlay rides with the actual zombie position instead of trailing it.
+        # ESP boxes go through in CAPTURED-FRAME COORDS untouched. The mod's render thread does the
+        # yaw/pitch delta compensation on EVERY render frame (HudBboxRenderer.renderRuntime), which
+        # tracks the actual zombie even between Python sends — fixes the visible "boxes trail during
+        # fast turns" symptom that a python-side compensation couldn't (it's stale by the time the mod
+        # actually paints the frame).
         action["boxes"] = last_boxes
-        if last_boxes and last_capture_ms is not None and last_focal_px is not None:
-            dy_drift, dp_drift = state.turn_since(last_capture_ms)
-            if abs(dy_drift) > 1e-3 or abs(dp_drift) > 1e-3:
-                # bearing -> pixels: ~tan(deg) * focal. Small-angle approx is fine (<10deg per frame).
-                dx_px = int(round(-math.tan(math.radians(dy_drift)) * last_focal_px))
-                dy_px = int(round(-math.tan(math.radians(dp_drift)) * last_focal_px))
-                action["boxes"] = [[b[0] + dx_px, b[1] + dy_px,
-                                    b[2] + dx_px, b[3] + dy_px, b[4]] for b in last_boxes]
         try:
             P.send_msg(sock, P.encode_action_bin(action))
         except (BrokenPipeError, ConnectionResetError, OSError):

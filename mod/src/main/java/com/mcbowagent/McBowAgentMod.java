@@ -57,8 +57,14 @@ public class McBowAgentMod implements ClientModInitializer {
                 // CAPTURE the detector's frame HERE, before our ESP is drawn -> the captured frame keeps the
                 // vanilla HUD (train/infer parity) but NOT our boxes (otherwise they feed back into detection).
                 bridge.renderCapture(mc);
-                if (config.hudBboxes) {   // F9: draw the live YOLO boxes AFTER the capture (display only)
-                    HudBboxRenderer.renderRuntime(matrices, mc, bridge.getLatestBoxes());
+                if (config.hudBboxes) {
+                    // Pass CURRENT player view so the renderer can pixel-shift each box by the yaw/pitch
+                    // delta since capture — kills the "boxes trail during big turns" symptom.
+                    float curYaw   = mc.player.yaw;
+                    float curPitch = mc.player.pitch;
+                    HudBboxRenderer.renderRuntime(matrices, mc, bridge.getLatestBoxes(),
+                            bridge.getCaptureYaw(), bridge.getCapturePitch(),
+                            curYaw, curPitch, bridge.hasCaptureView());
                 }
                 return;
             }

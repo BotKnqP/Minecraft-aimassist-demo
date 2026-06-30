@@ -71,6 +71,13 @@ public final class RuntimeBridge {
     private volatile RuntimeAction latestAction = null;
     private volatile long lastActionTimeMs = 0;
     private volatile int[][] latestBoxes = null;   // [x0,y0,x1,y1,role] per detection, for the HUD ESP overlay
+    // Yaw/pitch at the moment the LAST capture went out (the boxes Python returned are in THAT view's
+    // coordinates). The HUD renderer subtracts (currentYaw - captureYaw) * focal_px from each box every
+    // render frame so the overlay tracks the actual zombie position no matter how much the view has
+    // turned since capture — fixes the "boxes trail during big turns" symptom.
+    private volatile float captureYaw = 0f;
+    private volatile float capturePitch = 0f;
+    private volatile boolean haveCaptureView = false;
 
     /** Latest detection boxes (scaled-GUI coords) for the overlay, or null if absent/STALE. Render thread reads
      *  it. The freshness gate (mirrors the action's STALE handling, looser for the eye) stops frozen boxes from
@@ -78,6 +85,9 @@ public final class RuntimeBridge {
     public int[][] getLatestBoxes() {
         return (latestBoxes != null && System.currentTimeMillis() - lastActionTimeMs <= 1000L) ? latestBoxes : null;
     }
+    public float getCaptureYaw()   { return captureYaw; }
+    public float getCapturePitch() { return capturePitch; }
+    public boolean hasCaptureView() { return haveCaptureView; }
 
     private long frameSeq = 0;               // net thread only
     private volatile long actionSeq = 0;     // net writes, main reads (turn gating)
@@ -134,6 +144,7 @@ public final class RuntimeBridge {
     private void resetControl() {
         latestAction = null;
         latestBoxes = null;
+        haveCaptureView = false;
         lastActionTimeMs = 0;
         lastAppliedActionSeq = -1;
         lastAligned = false;
@@ -308,6 +319,7 @@ public final class RuntimeBridge {
         client = null;
         latestAction = null;       // req 3: never reuse a stale action after disconnect
         latestBoxes = null;
+        haveCaptureView = false;
         lastActionTimeMs = 0;
         // wake the writer thread if it's blocked in takeFrame.wait so it observes client==null and exits
         synchronized (frameLock) {
@@ -421,6 +433,14 @@ public final class RuntimeBridge {
             }
             lastSentCrc = crc;
             haveLastSentCrc = true;
+            // Pair the frame with the view it was captured in. Boxes Python returns are in THIS view's
+            // coordinates; the render thread shifts them by (currentYaw - captureYaw)*focal_px every frame.
+            ClientPlayerEntity p = mc.player;
+            if (p != null) {
+                captureYaw = p.yaw;
+                capturePitch = p.pitch;
+                haveCaptureView = true;
+            }
             trace(v, "[mcbowagent] capture success: bytes={} {}x{} fmt={}",
                     payload.length, w, h, cfg.runtimeRawFrame ? "raw" : "png");
             synchronized (frameLock) {
