@@ -1,0 +1,15 @@
+pluginManagement {
+    repositories {
+        maven { name = 'Fabric'; url = 'https://maven.fabricmc.net/' }
+        gradlePluginPortal()
+        mavenCentral()
+    }
+}
+
+plugins {
+    // Auto-provisions a JDK 8 for the Java toolchain even though only JDK 21 is
+    // installed locally (Gradle itself runs on JDK 21, compiles user code on JDK 8).
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '0.8.0'
+}
+
+rootProject.name = 'mcbowagent'

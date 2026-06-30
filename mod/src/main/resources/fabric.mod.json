@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "mcbowagent",
+  "version": "${version}",
+  "name": "MC Bow Agent Recorder",
+  "description": "Per-tick expert-demonstration recorder for a vision bow combat agent. Research / single-player only.",
+  "authors": ["mcbowagent"],
+  "contact": {},
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["com.mcbowagent.McBowAgentMod"]
+  },
+  "mixins": ["mcbowagent.mixins.json"],
+  "depends": {
+    "fabricloader": ">=0.14.0",
+    "minecraft": "1.16.5",
+    "fabric": "*",
+    "java": ">=8"
+  }
+}

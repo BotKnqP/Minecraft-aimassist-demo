@@ -1,0 +1,7 @@
+{
+  "category.mcbowagent": "MC Bow Agent",
+  "key.mcbowagent.toggle_record": "Toggle recording",
+  "key.mcbowagent.toggle_hud": "Toggle HUD bboxes",
+  "key.mcbowagent.toggle_oracle": "Toggle bow aimbot oracle",
+  "key.mcbowagent.toggle_runtime": "Toggle vision runtime (socket bridge)"
+}

@@ -1,0 +1,29 @@
+__pycache__/
+*.pyc
+.venv/
+.idea/
+.vscode/
+
+# data & artifacts
+/data/
+/expert/
+runs/
+*.mp4
+*.png
+*.jpg
+*.lmdb
+*.pt
+*.weights
+*.onnx
+*.engine
+
+# fabric mod build
+mod/build/
+mod/.gradle/
+mod/.gradle-manual/
+mod/run/
+build_log.txt
+
+# datasets generated locally (the YOLO data + the demo source video)
+datasets/
+assets/demo_src.mp4

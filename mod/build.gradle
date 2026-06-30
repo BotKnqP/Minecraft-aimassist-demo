@@ -1,0 +1,36 @@
+plugins {
+    // Modern Loom + Gradle 8.5 is REQUIRED here: only JDK 21 is installed, and
+    // old Loom/Gradle 7 cannot run on JDK 21. Loom 1.4 still builds MC 1.16.5.
+    id 'fabric-loom' version '1.4-SNAPSHOT'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+    archivesName = project.archives_base_name
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+}
+
+processResources {
+    inputs.property "version", project.version
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version
+    }
+}
+
+java {
+    // MC 1.16.5 is Java 8. Gradle runs on JDK 21; the toolchain provisions a
+    // JDK 8 (via the foojay resolver in settings.gradle) to compile against it.
+    // Do NOT add options.release = 8 — JDK 8's javac has no --release flag.
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(8)
+    }
+    withSourcesJar()
+}

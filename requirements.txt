@@ -1,0 +1,13 @@
+# Core (constants / action_mapping / ballistic / selftest)
+numpy>=1.26
+
+# Dataset conversion (dataset.py / selftest_dataset.py)
+pillow>=10.0
+
+# YOLO detector training/export (train.py) — vision phase
+ultralytics>=8.2
+opencv-python>=4.9
+# torch: install the CUDA 12.x build for the RTX 4060, e.g.
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# ONNX export (train.py --export onnx) — ultralytics auto-installs, or:
+#   pip install onnx onnxslim onnxruntime
