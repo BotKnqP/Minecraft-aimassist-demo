@@ -144,7 +144,7 @@ class _LatestFrameRecv:
 
 def run_client(detector, sock, k=DEFAULT_K, fov=DEFAULT_FOV, conf=0.5,
                max_frames=None, on_step=None, debug=False, show=False, tracker=None,
-               smoother=None, send_hz=20.0, predict_ms=300):
+               smoother=None, send_hz=20.0, predict_ms=300, fire_conf=0.0):
     """v0.7 three-thread loop:
       recv-thread:  socket  -> latest-frame slot (always 1, latest-wins)
       detect-thread: latest-frame slot -> detector.detect -> tracker.select -> TargetState
@@ -258,6 +258,13 @@ def run_client(detector, sock, k=DEFAULT_K, fov=DEFAULT_FOV, conf=0.5,
                     sol = replace(sol, fireable=False,
                                   d_yaw=max(-s, min(s, sol.d_yaw)),
                                   d_pitch=max(-s, min(s, sol.d_pitch)))
+                # Independent fire-confidence gate: detection threshold (--conf) is OK to keep low
+                # (0.25) so we still SEE distant zombies, but we refuse to fire unless the tracked
+                # target's last-measurement conf >= fire_conf. Set fire_conf high (0.55-0.7) to
+                # stop wasting arrows on borderline blobs / partial occlusion / friendly mobs the
+                # model second-guessed.
+                if sol.fireable and c < fire_conf:
+                    sol = replace(sol, fireable=False)
                 with shared_lock:
                     state.on_send(sol.d_yaw, sol.d_pitch, now_ms=time.time() * 1000.0)
 
@@ -294,6 +301,11 @@ def main(argv=None):
     ap.add_argument("--conf", type=float, default=0.25,
                     help="detection confidence; 0.25 catches far more zombies (the detector is "
                          "weak ~0.39 mAP); raise it if the bot fires at false positives")
+    ap.add_argument("--fire-conf", type=float, default=0.55,
+                    help="INDEPENDENT confidence floor before fire_ok is allowed (gates ONLY firing, "
+                         "not detection/tracking). Keep --conf low so the bot still SEES distant zombies, "
+                         "but set this 0.55-0.7 so it only shoots when the tracked target is a strong "
+                         "detection. Set 0 to disable the gate.")
     ap.add_argument("--device", default="cpu",
                     help="'cpu' recommended for the LIVE run (Minecraft already holds the GPU; "
                          "a CUDA context here fights it for VRAM/commit). 'cuda:0' only if you "
@@ -384,7 +396,7 @@ def main(argv=None):
             print("connected. running (Ctrl-C to stop).")
             t0[0] = time.time()
             try:
-                run_client(detector, sock, k=a.k, fov=a.fov, conf=a.conf,
+                run_client(detector, sock, k=a.k, fov=a.fov, conf=a.conf, fire_conf=a.fire_conf,
                            on_step=status, debug=a.debug_protocol, show=a.show, smoother=smoother,
                            send_hz=a.send_hz, predict_ms=a.predict_ms)
                 print("mod disconnected; reconnecting ...")

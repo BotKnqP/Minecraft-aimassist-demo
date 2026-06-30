@@ -23,12 +23,16 @@ public final class RecorderConfig {
                                                      // + downscale + PNG encode + disk write per saved frame.
                                                      // 10 Hz training data is plenty (the existing dataset is
                                                      // ~10 Hz) and at 20 Hz the render thread chokes.
-    public int runtimeCaptureHz = 60;                // target capture rate (Hz) when the runtime is on. Driven
+    public int runtimeCaptureHz = 30;                // target capture rate (Hz) when the runtime is on. Driven
                                                      // by the RENDER thread's own clock, not by client tick —
-                                                     // so it can go above the 20 Hz tick rate. Backpressure
-                                                     // (frameToSend != null) prevents pile-up when Python is
-                                                     // slower than this. Lower to 30/20/10 if your GPU can't
-                                                     // sustain the readback cost (~0.5-2 ms per frame).
+                                                     // so it can go above the 20 Hz tick rate.
+                                                     // 30 Hz default gives ~6× more frames than the v0.6
+                                                     // 10 Hz cap while leaving most render-thread budget for
+                                                     // the GAME itself (~1-3 ms readback per capture). Raise
+                                                     // to 60 if you have GPU headroom AND game FPS to spare;
+                                                     // 60 Hz capture eats 60-180 ms/s of render time.
+                                                     // Backpressure (frameToSend != null) prevents pile-up
+                                                     // when Python is slower than this.
     public int runtimeCaptureInterval = 2;           // DEPRECATED legacy: kept as a fallback for the recorder
                                                      // path (F8); F7 runtime now uses runtimeCaptureHz above.
 

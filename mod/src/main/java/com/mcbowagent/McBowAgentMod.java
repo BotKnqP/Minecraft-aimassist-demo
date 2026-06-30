@@ -21,7 +21,8 @@ import org.lwjgl.glfw.GLFW;
  * rather than raw mixins for ticking + HUD 鈥?idiomatic and robust. The mixin
  * package is reserved for the framebuffer-capture mixin (FrameCapture TODO).
  *
- * Keys: F8 start/stop recording, F9 toggle HUD bboxes, F10 toggle aimbot oracle.
+ * Keys: F6 cycle resolution presets, F7 vision runtime, F8 start/stop recording,
+ *       F9 toggle HUD bboxes, F10 toggle aimbot oracle.
  */
 public class McBowAgentMod implements ClientModInitializer {
 
@@ -40,6 +41,20 @@ public class McBowAgentMod implements ClientModInitializer {
     private KeyBinding keyToggleHud;
     private KeyBinding keyToggleOracle;
     private KeyBinding keyToggleRuntime;
+    private KeyBinding keyCycleRes;
+
+    /** F6-cycled fullscreen / window-size presets. First press DOWN-shifts (1280x720 is the most useful
+     *  drop for getting >60 FPS at modest GPU), then progressively smaller, then wraps back to 1920x1080
+     *  so the user can quickly return to "native-ish" without restarting the game. Verified by workflow:
+     *  Sodium 0.2.0 has no Window/Framebuffer/GLFW mixin, so the vanilla onResolutionChanged path runs
+     *  unmodified — no conflict. */
+    private static final int[][] RES_PRESETS = {
+            {1280, 720},
+            {960, 540},
+            {854, 480},
+            {1920, 1080},
+    };
+    private int resPresetIdx = 0;
 
     @Override
     public void onInitializeClient() {
@@ -47,6 +62,7 @@ public class McBowAgentMod implements ClientModInitializer {
         keyToggleHud = register("toggle_hud", GLFW.GLFW_KEY_F9);
         keyToggleOracle = register("toggle_oracle", GLFW.GLFW_KEY_F10);
         keyToggleRuntime = register("toggle_runtime", GLFW.GLFW_KEY_F7);
+        keyCycleRes = register("cycle_res", GLFW.GLFW_KEY_F6);
 
         ClientTickEvents.END_CLIENT_TICK.register(this::onEndTick);
 
@@ -74,7 +90,7 @@ public class McBowAgentMod implements ClientModInitializer {
                     config.recording, config.oracleEnabled, recorder.getTick());
         });
 
-        System.out.println("[mcbowagent] initialized (F7 runtime, F8 record, F9 hud, F10 oracle)");
+        System.out.println("[mcbowagent] initialized (F6 res-cycle, F7 runtime, F8 record, F9 hud, F10 oracle)");
     }
 
     private KeyBinding register(String name, int keyCode) {
@@ -94,6 +110,33 @@ public class McBowAgentMod implements ClientModInitializer {
             config.oracleEnabled = !config.oracleEnabled;
             if (!config.oracleEnabled && mc.player != null) {
                 mc.options.keyUse.setPressed(false);   // don't leave the bow drawn
+            }
+        }
+        while (keyCycleRes.wasPressed()) {
+            int[] wh = RES_PRESETS[resPresetIdx];
+            resPresetIdx = (resPresetIdx + 1) % RES_PRESETS.length;
+            int w = wh[0], h = wh[1];
+            net.minecraft.client.util.Window win = mc.getWindow();
+            net.minecraft.client.util.Monitor mon = win.getMonitor();
+            if (mon != null) {
+                int hz = mon.getCurrentVideoMode().getRefreshRate();
+                net.minecraft.client.util.VideoMode target = mon.findClosestVideoMode(
+                        java.util.Optional.of(new net.minecraft.client.util.VideoMode(w, h, 8, 8, 8, hz)));
+                // Fullscreen path: setVideoMode flips dirty; applyVideoMode no-ops if !fullscreen.
+                win.setVideoMode(java.util.Optional.of(target));
+                win.applyVideoMode();
+                mc.options.fullscreenResolution = target.asString();
+                mc.options.write();           // persist so next launch matches
+                // Windowed path: 1.16.5 has no Window.setWindowedSize. Drive GLFW directly; the engine's
+                // onWindowSizeChanged callback recomputes framebuffer + GUI scale + fires onResolutionChanged.
+                if (!win.isFullscreen()) {
+                    GLFW.glfwSetWindowSize(win.getHandle(), target.getWidth(), target.getHeight());
+                }
+                System.out.println("[mcbowagent] resolution -> " + target.getWidth() + "x" + target.getHeight()
+                        + (win.isFullscreen() ? " (fullscreen)" : " (windowed)"));
+            } else {
+                GLFW.glfwSetWindowSize(win.getHandle(), w, h);
+                System.out.println("[mcbowagent] resolution -> " + w + "x" + h + " (windowed, no monitor)");
             }
         }
         while (keyToggleRuntime.wasPressed()) {

@@ -107,6 +107,42 @@ def test_protocol_raw_frame_size_mismatch_raises():
     assert False, "expected ValueError on size mismatch"
 
 
+class _LowConfDetector:
+    """One centred zombie but conf=0.40 — below the default fire_conf=0.55."""
+    def detect(self, frame):
+        h, w = frame.shape[:2]
+        det = Detection.from_xyxy(w / 2 - 30, h / 2 - 60, w / 2 + 30, h / 2 + 60, 0.40)
+        return [det], (h, w)
+
+
+def test_fire_conf_gates_low_confidence_targets():
+    """A centred zombie at conf=0.40 with --fire-conf=0.55 must turn AT the target but NEVER fire."""
+    n = 3
+    received = []
+    srv, port, th = _mock_mod_server(_sample_frame_bytes(), n, received)
+    cli = socket.create_connection(("127.0.0.1", port))
+    try:
+        run_client(_LowConfDetector(), cli, max_frames=n, fire_conf=0.55)
+    finally:
+        cli.close()
+        srv.close()
+    th.join(timeout=5)
+    assert len(received) == n
+    for act in received:
+        assert act["has_target"] is True, "tracker should still see the target"
+        assert act["fire_ok"] is False, f"fire_conf=0.55 should gate a 0.40-conf target: {act}"
+    # And with the gate disabled (fire_conf=0), the SAME detector should be allowed to fire.
+    received2 = []
+    srv, port, th = _mock_mod_server(_sample_frame_bytes(), n, received2)
+    cli = socket.create_connection(("127.0.0.1", port))
+    try:
+        run_client(_LowConfDetector(), cli, max_frames=n, fire_conf=0.0)
+    finally:
+        cli.close(); srv.close()
+    th.join(timeout=5)
+    assert any(a["fire_ok"] for a in received2), "fire_conf=0 should let a 0.40 target fire"
+
+
 class FakeDetector:
     """One big centred zombie regardless of frame content (deterministic)."""
     def detect(self, frame):
