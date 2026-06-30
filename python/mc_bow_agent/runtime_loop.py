@@ -28,6 +28,7 @@ if _platform.system() == "Linux":
 
 from . import protocol as P
 from .aim import APPROACH_STEP_DEG, TargetTracker, aim_at
+from .detect_tracker import DetectionSmoother
 from .runtime import DEFAULT_FOV, DEFAULT_K
 
 
@@ -141,7 +142,8 @@ class _LatestFrameRecv:
 
 
 def run_client(detector, sock, k=DEFAULT_K, fov=DEFAULT_FOV, conf=0.5,
-               max_frames=None, on_step=None, debug=False, show=False, tracker=None):
+               max_frames=None, on_step=None, debug=False, show=False, tracker=None,
+               smoother=None):
     """Drive the pipelined loop on an open socket. The mod streams frames as soon as they're available;
     a background recv thread keeps only the LATEST one for us so detection wall-clock no longer caps
     capture rate. `detector` is any object with detect(frame)->(detections, shape). Returns
@@ -169,6 +171,8 @@ def run_client(detector, sock, k=DEFAULT_K, fov=DEFAULT_FOV, conf=0.5,
             if frame is not None:
                 h, w = frame.shape[:2]
                 dets = detector.detect(frame)[0]
+                if smoother is not None:
+                    dets = smoother.update(dets)      # frame-to-frame stabilisation (kills flicker)
                 target = tracker.select(dets, w, h, fov)  # aimbot lock: crosshair-nearest in FOV cone
                 sol = aim_at(target, w, h, fov, k=k) if target is not None else None
                 if sol is not None and not tracker.engaging:
@@ -221,6 +225,19 @@ def main(argv=None):
                     help="inference size; default auto = 416 on GPU (the source frame is 427x240 — pushing to "
                          "640 only upsamples height with no extra signal) / 320 on CPU (speed). Pass 640 to "
                          "match the trained size on a beefy GPU, or 256 for the lightest CPU runs.")
+    # Frame-to-frame detection smoother — cheap remedy for the weak detector's flicker on far targets.
+    ap.add_argument("--no-smooth", action="store_true",
+                    help="disable the IoU-tracker detection smoother (default ON). The smoother holds a "
+                         "missing detection alive for --smooth-miss frames and EMA-smooths the box.")
+    ap.add_argument("--smooth-miss", type=int, default=2,
+                    help="frames to hold a missing detection before dropping it (default 2 = ~200ms at 10fps)")
+    ap.add_argument("--smooth-iou", type=float, default=0.3,
+                    help="IoU threshold for considering two boxes the same object across frames (default 0.3)")
+    ap.add_argument("--smooth-ema", type=float, default=0.7,
+                    help="EMA factor for box-coord smoothing; 1.0 = no smoothing, 0.0 = freeze (default 0.7)")
+    ap.add_argument("--smooth-hits", type=int, default=1,
+                    help="frames a NEW detection must survive before being surfaced; 1=immediate (default), "
+                         "2+ suppresses single-frame false positives at the cost of 1 frame of latency")
     ap.add_argument("--backend", choices=("auto", "ultralytics", "onnxruntime"), default="auto",
                     help="inference backend. auto = .pt -> Ultralytics, .onnx -> onnxruntime (with "
                          "DirectML/CUDA/CPU provider auto-pick) if installed, else Ultralytics. "
@@ -247,6 +264,11 @@ def main(argv=None):
 
     from .runtime import make_detector
     detector = make_detector(a.weights, conf=a.conf, device=device, imgsz=imgsz, backend=a.backend)
+    smoother = None if a.no_smooth else DetectionSmoother(
+        iou_thresh=a.smooth_iou, max_miss=a.smooth_miss, ema=a.smooth_ema, min_hits=a.smooth_hits)
+    if smoother is not None:
+        print(f"[runtime] smoother on: iou>={a.smooth_iou} max_miss={a.smooth_miss} "
+              f"ema={a.smooth_ema} min_hits={a.smooth_hits}")
 
     t0 = [time.time()]
 
@@ -278,7 +300,7 @@ def main(argv=None):
             t0[0] = time.time()
             try:
                 run_client(detector, sock, k=a.k, fov=a.fov, conf=a.conf,
-                           on_step=status, debug=a.debug_protocol, show=a.show)
+                           on_step=status, debug=a.debug_protocol, show=a.show, smoother=smoother)
                 print("mod disconnected; reconnecting ...")
             except Exception as e:           # ANY error -> reconnect, never crash (Ctrl-C still exits)
                 print(f"disconnected ({type(e).__name__}: {e}); reconnecting ...")
