@@ -111,10 +111,11 @@ python -m mc_bow_agent.calibrate ../runs --class zombie                    # pri
 
 **③ Run the agent** — in-game press **F7** (starts the mod's socket server + shows the box overlay), then:
 ```bash
+# run from inside ./python (so `runs/...` resolves) -- or pass an absolute path from the repo root.
 # CPU (default; imgsz auto = 320)
-python -m mc_bow_agent.runtime_loop --weights runs/detect/mcbow_zombie_v2/weights/best.pt --device cpu
-# GPU (lower Minecraft's RAM first to free commit memory; imgsz auto = 640, OOM auto-falls back to CPU)
-python -m mc_bow_agent.runtime_loop --weights runs/detect/mcbow_zombie_v2/weights/best.pt --device cuda:0
+python -m mc_bow_agent.runtime_loop --weights runs/detect/mcbow_zombie_v2/weights/best.onnx --device cpu
+# GPU (lower Minecraft's RAM first to free commit memory; imgsz auto = 416, OOM auto-falls back to CPU)
+python -m mc_bow_agent.runtime_loop --weights runs/detect/mcbow_zombie_v2/weights/best.onnx --device cuda:0
 ```
 The boxes show **in-game** (toggle F9). Add `--show` for a separate OpenCV debug window; pass `--imgsz 320/416` to override the auto size.
 
@@ -235,10 +236,11 @@ python -m mc_bow_agent.calibrate ../runs --class zombie                    # 打
 
 **③ 运行智能体** —— 游戏内先按 **F7**(启动 mod 的 socket 服务 + 显示识别框),然后:
 ```bash
+# 在 ./python 目录下跑(这样 `runs/...` 才能解析);或从仓库根传绝对路径。
 # CPU（默认；imgsz 自动 = 320）
-python -m mc_bow_agent.runtime_loop --weights runs/detect/mcbow_zombie_v2/weights/best.pt --device cpu
-# GPU（先在启动器把 MC 内存调低腾出提交内存；imgsz 自动 = 640，OOM 自动回退 CPU）
-python -m mc_bow_agent.runtime_loop --weights runs/detect/mcbow_zombie_v2/weights/best.pt --device cuda:0
+python -m mc_bow_agent.runtime_loop --weights runs/detect/mcbow_zombie_v2/weights/best.onnx --device cpu
+# GPU（先在启动器把 MC 内存调低腾出提交内存；imgsz 自动 = 416，OOM 自动回退 CPU）
+python -m mc_bow_agent.runtime_loop --weights runs/detect/mcbow_zombie_v2/weights/best.onnx --device cuda:0
 ```
 识别框直接画在**游戏画面**里(F9 开关)。想要独立 OpenCV 调试窗口就加 `--show`;`--imgsz 320/416` 可覆盖自动尺寸。
 
