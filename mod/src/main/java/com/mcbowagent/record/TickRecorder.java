@@ -43,6 +43,7 @@ public final class TickRecorder {
     private final FrameCapture frameCapture = new FrameCapture();
 
     private JsonlWriter writer;
+    private AsyncFrameWriter pngWriter;     // off-thread PNG encode + disk write
     private Path runDir;
     private long tick = 0;
 
@@ -69,6 +70,7 @@ public final class TickRecorder {
             Path dir = Paths.get(cfg.outputBaseDir, "run_" + stamp);
             Path episode = dir.resolve("episode_0001.jsonl");
             writer = new JsonlWriter(episode);
+            pngWriter = new AsyncFrameWriter();
             this.runDir = dir;
             tick = 0;
             hasPrev = false;
@@ -86,7 +88,16 @@ public final class TickRecorder {
             try { writer.close(); } catch (IOException ignored) {}
             writer = null;
         }
-        System.out.println("[mcbowagent] recording stopped at tick " + tick);
+        if (pngWriter != null) {
+            long w = pngWriter.writtenCount();
+            long d = pngWriter.droppedCount();
+            pngWriter.close();        // drains the queue, joins the worker
+            pngWriter = null;
+            System.out.println("[mcbowagent] recording stopped at tick " + tick
+                    + " (frames written=" + w + " dropped=" + d + ")");
+        } else {
+            System.out.println("[mcbowagent] recording stopped at tick " + tick);
+        }
     }
 
     /** Call once per client tick (END_CLIENT_TICK). */
@@ -130,8 +141,10 @@ public final class TickRecorder {
         }
         this.latestMobs = mobs;
 
-        // 3) write a row if recording
-        if (cfg.recording && writer != null) {
+        // 3) write a row if recording. Sample at recordCaptureInterval (default 10 Hz) — the per-tick path
+        //    is the heavy one (GL readback + PNG encode + disk write) and at 20 Hz the render thread chokes.
+        int recInterval = Math.max(1, cfg.recordCaptureInterval);
+        if (cfg.recording && writer != null && tick % recInterval == 0) {
             boolean curUsingBow = p.isUsingItem() && p.getActiveItem().getItem() == Items.BOW;
             int curCharge = curUsingBow ? p.getItemUseTime() : 0;
             float curHealth = p.getHealth();
@@ -151,12 +164,19 @@ public final class TickRecorder {
 
             String framePath = frameCapture.frameRelPath(tick);
             writeRow(player, mobs, action, events, framePath);
-            if (runDir != null) {
-                // capture downscaled to the SAME (w,h) the bboxes were projected in
-                frameCapture.capture(mc, runDir.resolve(framePath), w, h);
+            if (runDir != null && pngWriter != null) {
+                // GL readback + downscale ON the render thread (we have to — GL state is here), but PNG
+                // encode + disk write GO TO the background writer thread. Frees the render thread of the
+                // ~10-20 ms PNG/IO stall per recorded frame.
+                net.minecraft.client.texture.NativeImage small = frameCapture.captureSmallImage(mc, w, h);
+                if (small != null && !pngWriter.submit(small, runDir.resolve(framePath))) {
+                    // queue full (disk stalled) — drop this frame to keep the game smooth
+                    small.close();
+                }
             }
-            tick++;
         }
+        if (cfg.recording && writer != null) tick++;   // advance the tick index every game tick while recording
+                                                       // (so the recInterval modulo above samples correctly)
 
         // 4) update prev trackers every tick
         prevYaw = p.yaw;

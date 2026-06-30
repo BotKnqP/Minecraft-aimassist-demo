@@ -31,6 +31,34 @@ public final class FrameCapture {
         return String.format(Locale.US, "frames/frame_%06d.png", tick);
     }
 
+    /** Render-thread only: GL readback + vertical mirror + downscale to (targetW, targetH). Returns the
+     *  small NativeImage OWNED BY THE CALLER (must be close()d after the consumer is done with it). The
+     *  PNG encode + disk write are NOT done here — hand the result to AsyncFrameWriter. Null if the
+     *  framebuffer isn't ready yet. */
+    public NativeImage captureSmallImage(MinecraftClient mc, int targetW, int targetH) {
+        Framebuffer fb = mc.getFramebuffer();
+        int w = fb.textureWidth;
+        int h = fb.textureHeight;
+        if (w <= 0 || h <= 0) return null;
+        NativeImage full = new NativeImage(w, h, false);
+        try {
+            RenderSystem.bindTexture(fb.getColorAttachment());
+            full.loadFromTextureImage(0, true);
+            full.mirrorVertically();
+            if (targetW > 0 && targetH > 0 && (targetW != w || targetH != h)) {
+                NativeImage small = new NativeImage(targetW, targetH, false);
+                full.resizeSubRectTo(0, 0, w, h, small);
+                return small;
+            }
+            // edge case: target == source. Return a copy so the caller can close it independently.
+            NativeImage copy = new NativeImage(w, h, false);
+            full.resizeSubRectTo(0, 0, w, h, copy);
+            return copy;
+        } finally {
+            full.close();
+        }
+    }
+
     /** Grab the current frame, downscale to (targetW,targetH), write a PNG. Non-fatal on error. */
     public void capture(MinecraftClient mc, Path outFile, int targetW, int targetH) {
         Framebuffer fb = mc.getFramebuffer();

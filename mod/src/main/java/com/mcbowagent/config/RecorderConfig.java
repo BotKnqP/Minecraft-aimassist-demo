@@ -18,6 +18,11 @@ public final class RecorderConfig {
                                                      // PNG encode on the render thread; Python sniffs 'R' vs
                                                      // PNG magic so legacy peers still work). Toggle false to
                                                      // force PNG if a peer can't handle raw.
+    public int recordCaptureInterval = 2;            // RECORD a frame every N client ticks (~10 Hz default).
+                                                     // The recorder is the heavy path: full-res GL readback
+                                                     // + downscale + PNG encode + disk write per saved frame.
+                                                     // 10 Hz training data is plenty (the existing dataset is
+                                                     // ~10 Hz) and at 20 Hz the render thread chokes.
     public int runtimeCaptureInterval = 2;           // capture/send every N client ticks (raise if laggy).
                                                      // ~2 (10 Hz) is the new default now that raw-BGR capture
                                                      // (no PNG encode) + the pipelined socket let the mod feed
