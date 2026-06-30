@@ -18,9 +18,12 @@ public final class RecorderConfig {
                                                      // PNG encode on the render thread; Python sniffs 'R' vs
                                                      // PNG magic so legacy peers still work). Toggle false to
                                                      // force PNG if a peer can't handle raw.
-    public int runtimeCaptureInterval = 4;           // capture/send every N client ticks (raise if laggy).
-                                                     // ~4 (5 Hz) matches CPU YOLO throughput so frames don't
-                                                     // pile up (less game lag + less latency -> less overshoot).
+    public int runtimeCaptureInterval = 2;           // capture/send every N client ticks (raise if laggy).
+                                                     // ~2 (10 Hz) is the new default now that raw-BGR capture
+                                                     // (no PNG encode) + the pipelined socket let the mod feed
+                                                     // a fast Python detector without bottlenecking it. With a
+                                                     // CPU-only detector at <10 fps this just means dedup will
+                                                     // drop the extra frames cheaply (CRC32 -> no-op).
 
     // --- scan / output ---
     public double scanRadius = 40.0;                 // blocks; only log hostiles within this
