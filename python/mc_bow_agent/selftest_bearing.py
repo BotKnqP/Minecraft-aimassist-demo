@@ -80,6 +80,42 @@ def test_age_ms_and_reset():
     assert not s.has_target(now_ms=150.0)
 
 
+def test_on_measurement_back_corrects_by_capture_ms():
+    """The bug v0.4.1 fixes: a fresh detection arrives ~100ms after the frame was captured. Between
+    capture and now, Python sent N actions and the mod turned each one. The MEASURED bearing is the
+    target's position IN THE STALE VIEW; the bearing in CURRENT view is measured - sum(those turns).
+    Without this back-correction the overshoot was unavoidable."""
+    s = TargetState(max_predict_ms=300)
+    # baseline measurement at t=0 ms; target at 10° right
+    s.on_measurement(d_yaw=10.0, d_pitch=0.0, bbox_h=40, bbox_w=20, conf=0.9, now_ms=0.0)
+    assert approx(s.current_bearing()[0], 10.0)
+    # Python sends two actions while a new frame is being captured + transported + processed
+    s.on_send(sent_d_yaw=10.0, sent_d_pitch=0.0, now_ms=50.0)    # mod will turn 4.5 right
+    s.on_send(sent_d_yaw=5.5,  sent_d_pitch=0.0, now_ms=100.0)   # mod will turn 2.475 right
+    # frame was captured at t=50 (between the two sends). In that view, target was at 10-4.5=5.5°
+    # (only the FIRST send had taken effect). At t=120 (now) we get the result.
+    s.on_measurement(d_yaw=5.5, d_pitch=0.0, bbox_h=40, bbox_w=20, conf=0.9,
+                     now_ms=120.0, capture_ms=50.0)
+    # back-correction: subtract only sends with ts >= capture_ms (=50.0). That's BOTH sends since
+    # the first send was AT ts=50.0 and the second was at 100.0. But wait — the first send was AT
+    # the moment of capture, before the mod actually applied it. So the measurement is AT capture,
+    # and we need to subtract every turn that happened AFTER capture. Both sends are >= 50.0.
+    # adjusted = 5.5 - (4.5 + 2.475) = -1.475   (i.e. the target should now be slightly LEFT)
+    bearing_dy, _, _, _, _ = s.current_bearing()
+    assert approx(bearing_dy, 5.5 - 4.5 - 2.475, 1e-6)
+
+
+def test_turn_since_sums_sends_after_capture():
+    s = TargetState()
+    s.on_measurement(d_yaw=0.0, d_pitch=0.0, bbox_h=40, bbox_w=20, conf=0.9, now_ms=0.0)
+    s.on_send(sent_d_yaw=5.0, sent_d_pitch=0.0, now_ms=10.0)    # mod turn ~2.25 yaw
+    s.on_send(sent_d_yaw=5.0, sent_d_pitch=0.0, now_ms=60.0)    # mod turn ~2.25 yaw
+    s.on_send(sent_d_yaw=5.0, sent_d_pitch=0.0, now_ms=110.0)   # mod turn ~2.25 yaw
+    # frame captured at t=50 -> sends with ts >= 50 are the 2nd and 3rd
+    dy, dp = s.turn_since(capture_ms=50.0)
+    assert approx(dy, 2.25 + 2.25, 1e-6) and approx(dp, 0.0, 1e-6)
+
+
 def test_predict_window_drops_target_after_grace():
     """Per GPT's acceptance criteria: 300 ms after last measurement, has_target falls to False."""
     s = TargetState(max_predict_ms=300)

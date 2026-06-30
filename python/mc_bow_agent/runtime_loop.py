@@ -13,6 +13,7 @@ cur_pitch+d_pitch) clamped <=10 deg/tick, hold the bow while fire_ok, release
 else release the bow (optionally slow-scan). See docs/RUNTIME_PROTOCOL.md.
 """
 import argparse
+import math
 import os
 import socket
 import threading
@@ -163,6 +164,8 @@ def run_client(detector, sock, k=DEFAULT_K, fov=DEFAULT_FOV, conf=0.5,
     # on a tick where no fresh detection arrived
     last_boxes = []
     last_engaging = False
+    last_capture_ms = None        # capture_ms of the last detection frame (for ESP drift compensation)
+    last_focal_px = None          # focal length cache (depends only on frame H + fov)
 
     last_send = 0.0
     frames = sends = targets = 0
@@ -180,30 +183,33 @@ def run_client(detector, sock, k=DEFAULT_K, fov=DEFAULT_FOV, conf=0.5,
             frame = None
             dets = []
             target = None
+            meta = {}
             try:
-                frame = P.decode_frame(png)
+                frame, meta = P.decode_frame(png)
                 if frame is not None:
                     last_h, last_w = frame.shape[:2]
+                    last_capture_ms = meta.get("capture_ms")    # None for legacy 'R' frames
                     dets = detector.detect(frame)[0]
                     if smoother is not None:
                         dets = smoother.update(dets)
                     target = tracker.select(dets, last_w, last_h, fov)
-                    # update the high-freq bearing state ONLY from in-cone (engaging) detections;
-                    # an approach target is "turn toward this off-cone box" not "shoot here yet"
                     if target is not None and tracker.engaging:
+                        # measure bearing IN THE CAPTURED FRAME. Pass capture_ms so TargetState
+                        # subtracts any expected mod-turn that happened AFTER capture (during the
+                        # inference round-trip) -- otherwise the snap is stale and the next emit
+                        # overshoots.
                         dy, dp = bearing_from_bbox(target.cx, target.cy, last_w, last_h, fov)
-                        now_ms = time.monotonic() * 1000.0
-                        state.on_measurement(dy, dp, target.h, target.w, target.conf, now_ms)
-                    elif target is None or not tracker.engaging:
-                        # losing the engage target: let TargetState's predict_ms grace decide when
-                        # to actually drop. Don't snap-reset here -- a 1-frame detection miss in
-                        # the middle of a shot must not zero the bearing.
-                        pass
+                        now_ms = time.time() * 1000.0
+                        state.on_measurement(dy, dp, target.h, target.w, target.conf,
+                                             now_ms, capture_ms=last_capture_ms)
                     last_engaging = bool(target is not None and tracker.engaging)
                     last_boxes = boxes_payload(dets, target, last_engaging)
+                    # cache focal so we can shift the ESP boxes by mod-turn-since-capture below
+                    last_focal_px = (last_h / 2.0) / math.tan(math.radians(fov) / 2.0)
                 if debug:
+                    age = (time.time() * 1000.0 - last_capture_ms) if last_capture_ms else -1
                     print(f"[recv] frame#{frames} bytes={len(png)} det={len(dets)} "
-                          f"target={target is not None} engaging={last_engaging}")
+                          f"target={target is not None} engaging={last_engaging} stale_ms={age:.0f}")
             except Exception as e:
                 print(f"[frame {frames}] inference skipped ({type(e).__name__}: {e})")
             if show and frame is not None:
@@ -226,8 +232,10 @@ def run_client(detector, sock, k=DEFAULT_K, fov=DEFAULT_FOV, conf=0.5,
             dy, dp, h_px, w_px, c = state.current_bearing()
             sol = aim_from_bearing(dy, dp, h_px, k=k, frame_h=last_h, fov_deg=fov)
             # account for the turn the mod is about to make from THIS action: subtract the
-            # expected actual movement (mirrored gain + clamp + deadzone) from our held bearing
-            state.on_send(sol.d_yaw, sol.d_pitch)
+            # expected actual movement (mirrored gain + clamp + deadzone) from our held bearing.
+            # Pass wall-clock ms so the send-history (used by on_measurement back-correction) is
+            # tagged with the SAME clock the mod stamps frames with.
+            state.on_send(sol.d_yaw, sol.d_pitch, now_ms=time.time() * 1000.0)
         # ESP overlay & "look to the other side" pan only matter when we have NO engage target
         # AND there's a current TargetTracker approach selection -- handled inside the detection
         # leg above by simply not updating state. If the tracker holds an approach selection on
@@ -244,7 +252,18 @@ def run_client(detector, sock, k=DEFAULT_K, fov=DEFAULT_FOV, conf=0.5,
                           d_pitch=max(-s, min(s, sol_app.d_pitch)))
 
         action = aim_to_action(sol, n_det=len(last_boxes))
+        # ESP drift compensation: the boxes we have are from the LAST captured frame; since then the
+        # mod has been turning. Shift every box by the cumulative expected mod-turn since capture so
+        # the in-game overlay rides with the actual zombie position instead of trailing it.
         action["boxes"] = last_boxes
+        if last_boxes and last_capture_ms is not None and last_focal_px is not None:
+            dy_drift, dp_drift = state.turn_since(last_capture_ms)
+            if abs(dy_drift) > 1e-3 or abs(dp_drift) > 1e-3:
+                # bearing -> pixels: ~tan(deg) * focal. Small-angle approx is fine (<10deg per frame).
+                dx_px = int(round(-math.tan(math.radians(dy_drift)) * last_focal_px))
+                dy_px = int(round(-math.tan(math.radians(dp_drift)) * last_focal_px))
+                action["boxes"] = [[b[0] + dx_px, b[1] + dy_px,
+                                    b[2] + dx_px, b[3] + dy_px, b[4]] for b in last_boxes]
         try:
             P.send_msg(sock, P.encode_action_bin(action))
         except (BrokenPipeError, ConnectionResetError, OSError):

@@ -134,14 +134,15 @@ public final class FrameCapture {
 
     /**
      * Fast path for the live runtime: same capture+downscale as captureBytes, but skip PNG encoding and
-     * emit RAW BGR pixels prefixed by a 5-byte header [magic='R'][W:u16 big-endian][H:u16 big-endian].
-     * Payload layout: 5 + W*H*3 bytes. PNG encoding was the largest per-frame cost on the render thread
-     * (~10-20 ms at 427x240); the raw path takes ~1-2 ms for the same pixel pass. Python's protocol.decode_frame
-     * sniffs the first byte ('R' raw vs 0x89 PNG) so the legacy PNG path remains compatible.
+     * emit RAW BGR pixels prefixed by a 13-byte header
+     *   [magic='V'][W:u16 BE][H:u16 BE][capture_unix_ms:u64 BE]
+     * Payload layout: 13 + W*H*3 bytes.
      *
-     * Uses {@code NativeImage.getPixelColor(x, y)} for portability — the Yarn ByteBuffer accessor varies
-     * across mappings, but getPixelColor has been stable. ~100k calls fit well under 2 ms at the scaled-GUI
-     * size (~427x240). NativeImage stores ABGR int per pixel: extract B/G/R via byte shifts and pack as BGR.
+     * The capture_unix_ms timestamp (System.currentTimeMillis at the moment of GL readback) lets the Python
+     * tracker subtract "mod turn since capture" from the measured bearing, killing the overshoot caused by
+     * staleness (~50-150 ms detection latency on CPU YOLO).
+     *
+     * Python's protocol.decode_frame sniffs the first byte and routes 'V' raw-v2 / 'R' raw-v1 / 0x89 PNG.
      */
     public byte[] captureRawBytes(MinecraftClient mc, int targetW, int targetH) {
         Framebuffer fb = mc.getFramebuffer();
@@ -167,13 +168,19 @@ public final class FrameCapture {
                 oh = targetH;
             }
             try {
-                byte[] out = new byte[5 + ow * oh * 3];
-                out[0] = (byte) 'R';
+                // Versioned raw header 'V': adds an 8-byte capture timestamp so the Python tracker can
+                // subtract "mod turn since capture" from the measured bearing.
+                long captureMs = System.currentTimeMillis();
+                byte[] out = new byte[13 + ow * oh * 3];
+                out[0] = (byte) 'V';
                 out[1] = (byte) ((ow >>> 8) & 0xff);
                 out[2] = (byte) (ow & 0xff);
                 out[3] = (byte) ((oh >>> 8) & 0xff);
                 out[4] = (byte) (oh & 0xff);
-                int o = 5;
+                for (int i = 0; i < 8; i++) {
+                    out[5 + i] = (byte) ((captureMs >>> (8 * (7 - i))) & 0xff);
+                }
+                int o = 13;
                 for (int y = 0; y < oh; y++) {
                     for (int x = 0; x < ow; x++) {
                         int c = outImg.getPixelColor(x, y);   // ABGR: A=high, then B, G, R

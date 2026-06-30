@@ -99,27 +99,39 @@ def decode_action(buf: bytes) -> dict:
 
 
 def decode_frame(buf: bytes):
-    """Decode a frame payload to an HxWx3 BGR ndarray (matches how Ultralytics loads images, so
-    train/infer colour order is consistent).
+    """Decode a frame payload to (HxWx3 BGR ndarray, meta dict).
 
-    Supports two wire formats, distinguished by the first byte:
-      * 'R' (0x52) — raw BGR, fast path: [magic 'R'][W:u16 BE][H:u16 BE][BGR bytes...] (~10-20 ms cheaper
-        than PNG on the mod side because it skips PNG encoding entirely).
-      * 0x89 — PNG, legacy path: decoded via cv2.imdecode (or PIL fallback).
+    Three wire formats, distinguished by the first byte:
+      * 'V' (0x56) — VERSIONED raw BGR, fast path WITH capture timestamp:
+          [magic 'V'][W:u16 BE][H:u16 BE][capture_unix_ms:u64 BE][BGR bytes...]
+          meta = {'capture_ms': <int>}  (mod's System.currentTimeMillis at GL readback)
+      * 'R' (0x52) — legacy raw BGR (no timestamp): [magic 'R'][W:u16 BE][H:u16 BE][BGR bytes...]
+          meta = {}
+      * 0x89 — PNG: decoded via cv2.imdecode (or PIL fallback). meta = {}
     """
     import numpy as np
-    if buf and buf[0] == 0x52:                                   # 'R' — raw BGR
+    if buf and buf[0] == 0x56:                                   # 'V' — versioned raw BGR (+ capture_ms)
+        w = int.from_bytes(buf[1:3], "big")
+        h = int.from_bytes(buf[3:5], "big")
+        cap_ms = int.from_bytes(buf[5:13], "big")
+        expected = 13 + w * h * 3
+        if len(buf) != expected:
+            raise ValueError(f"raw-v frame size mismatch: header says {w}x{h} (need {expected} bytes), got {len(buf)}")
+        frame = np.frombuffer(buf, dtype=np.uint8, count=w * h * 3, offset=13).reshape(h, w, 3)
+        return frame, {"capture_ms": cap_ms}
+    if buf and buf[0] == 0x52:                                   # 'R' — legacy raw BGR
         w = int.from_bytes(buf[1:3], "big")
         h = int.from_bytes(buf[3:5], "big")
         expected = 5 + w * h * 3
         if len(buf) != expected:
             raise ValueError(f"raw frame size mismatch: header says {w}x{h} (need {expected} bytes), got {len(buf)}")
-        return np.frombuffer(buf, dtype=np.uint8, count=w * h * 3, offset=5).reshape(h, w, 3)
+        frame = np.frombuffer(buf, dtype=np.uint8, count=w * h * 3, offset=5).reshape(h, w, 3)
+        return frame, {}
     try:
         import cv2
-        return cv2.imdecode(np.frombuffer(buf, np.uint8), cv2.IMREAD_COLOR)
+        return cv2.imdecode(np.frombuffer(buf, np.uint8), cv2.IMREAD_COLOR), {}
     except ImportError:
         import io
         from PIL import Image
         rgb = np.asarray(Image.open(io.BytesIO(buf)).convert("RGB"))
-        return rgb[:, :, ::-1].copy()                            # RGB -> BGR
+        return rgb[:, :, ::-1].copy(), {}                        # RGB -> BGR

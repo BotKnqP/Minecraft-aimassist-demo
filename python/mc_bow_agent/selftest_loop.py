@@ -22,16 +22,33 @@ def approx(a, b, t=1e-6):
 
 
 def test_protocol_raw_frame_roundtrip():
-    """The mod's raw-BGR payload [magic 'R'][W u16 BE][H u16 BE][W*H*3 BGR] must decode losslessly to the
-    same HxWx3 BGR ndarray a PNG would. Locks in the wire format both sides depend on."""
+    """Legacy 'R' raw-BGR payload [magic 'R'][W u16 BE][H u16 BE][W*H*3 BGR] decodes losslessly.
+    decode_frame returns (frame, meta_dict); for 'R' the meta is empty."""
     import numpy as np
     W, H = 17, 11
     rng = np.arange(H * W * 3, dtype=np.uint8).reshape(H, W, 3)
     payload = bytes([ord('R'), (W >> 8) & 0xff, W & 0xff, (H >> 8) & 0xff, H & 0xff]) + rng.tobytes()
-    out = P.decode_frame(payload)
+    out, meta = P.decode_frame(payload)
     assert out.shape == (H, W, 3)
     assert out.dtype == np.uint8
     assert np.array_equal(out, rng)
+    assert meta == {}
+
+
+def test_protocol_raw_v_frame_carries_capture_ms():
+    """The new 'V' raw-versioned payload carries an 8-byte capture_unix_ms so Python can back-correct
+    a measurement by the mod-turn that happened during the inference round-trip."""
+    import numpy as np
+    W, H = 17, 11
+    cap_ms = 0x0123456789ABCDEF
+    rng = np.arange(H * W * 3, dtype=np.uint8).reshape(H, W, 3)
+    hdr = bytes([ord('V'), (W >> 8) & 0xff, W & 0xff, (H >> 8) & 0xff, H & 0xff])
+    cap = cap_ms.to_bytes(8, "big")
+    payload = hdr + cap + rng.tobytes()
+    out, meta = P.decode_frame(payload)
+    assert out.shape == (H, W, 3)
+    assert np.array_equal(out, rng)
+    assert meta == {"capture_ms": cap_ms}
 
 
 def test_protocol_binary_action_roundtrip():

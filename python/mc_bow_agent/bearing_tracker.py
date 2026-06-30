@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections import deque
 from dataclasses import dataclass
 
 
@@ -58,9 +59,14 @@ class TargetState:
     """Holds the committed target's bearing in CURRENT view. Updated by fresh detections,
     decayed by commanded turns. is_stale(now) reports if the held value is too old to trust."""
 
-    def __init__(self, max_predict_ms: int = 300):
+    def __init__(self, max_predict_ms: int = 300, send_history_ms: int = 1000):
         self.max_predict_ms = int(max_predict_ms)
+        self.send_history_ms = int(send_history_ms)
         self._st = None     # _State or None
+        # ring of (send_unix_ms, expected_mod_yaw_turn_deg, expected_mod_pitch_turn_deg).
+        # Used to back-correct a fresh detection: subtract every turn that happened AFTER the
+        # frame's capture_ms so the bearing reflects the CURRENT view, not the stale capture view.
+        self._sends: deque = deque()
 
     # ---------------- public API ---------------------------------------------------------
 
@@ -72,25 +78,60 @@ class TargetState:
         return (now_ms - self._st.last_meas_ts_ms) <= self.max_predict_ms
 
     def on_measurement(self, d_yaw: float, d_pitch: float, bbox_h: float,
-                       bbox_w: float, conf: float, now_ms: float) -> None:
-        """A fresh detection arrived — snap the held bearing to it."""
+                       bbox_w: float, conf: float, now_ms: float,
+                       capture_ms: float = None) -> None:
+        """A fresh detection arrived — snap the held bearing to it. The measurement was made on
+        a frame CAPTURED at `capture_ms` (mod wall-clock ms); since then the mod has been
+        turning per our commands. Subtract the cumulative expected mod-turn AFTER capture so the
+        snapped bearing reflects the CURRENT view, not the stale capture view. capture_ms=None
+        falls back to legacy "trust the raw measurement" behaviour (used by old 'R' frames + tests)."""
+        adj_dy = float(d_yaw)
+        adj_dp = float(d_pitch)
+        if capture_ms is not None:
+            # subtract every expected mod-turn from sends that happened AT OR AFTER capture_ms
+            for ts, dy_t, dp_t in self._sends:
+                if ts >= capture_ms:
+                    adj_dy -= dy_t
+                    adj_dp -= dp_t
         self._st = _State(
-            bearing_dy=float(d_yaw),
-            bearing_dp=float(d_pitch),
+            bearing_dy=adj_dy,
+            bearing_dp=adj_dp,
             bbox_h=float(bbox_h),
             bbox_w=float(bbox_w),
             conf=float(conf),
             last_meas_ts_ms=float(now_ms),
         )
 
-    def on_send(self, sent_d_yaw: float, sent_d_pitch: float) -> None:
+    def on_send(self, sent_d_yaw: float, sent_d_pitch: float, now_ms: float = None) -> None:
         """Account for the turn the mod is about to apply: subtract the EXPECTED actual
         movement (gain + clamp + deadzone) from our held bearing so the NEXT emit reflects
-        the view we'll be at one tick from now. No-op when no target is held."""
+        the view we'll be at one tick from now. Also append (ts, expected_y, expected_p) to the
+        send history so a later on_measurement can back-correct a frame that was captured
+        before some of these sends. No-op when no target is held."""
+        if now_ms is None:
+            now_ms = time.time() * 1000.0  # wall clock (matches mod's System.currentTimeMillis)
+        ey = expected_mod_turn(sent_d_yaw)
+        ep = expected_mod_turn(sent_d_pitch)
+        # prune old entries
+        cutoff = now_ms - self.send_history_ms
+        while self._sends and self._sends[0][0] < cutoff:
+            self._sends.popleft()
+        self._sends.append((float(now_ms), ey, ep))
         if self._st is None:
             return
-        self._st.bearing_dy -= expected_mod_turn(sent_d_yaw)
-        self._st.bearing_dp -= expected_mod_turn(sent_d_pitch)
+        self._st.bearing_dy -= ey
+        self._st.bearing_dp -= ep
+
+    def turn_since(self, capture_ms: float) -> tuple:
+        """Sum of (expected_yaw_turn, expected_pitch_turn) for every send AT OR AFTER capture_ms.
+        Used to drift-correct the ESP overlay's box positions between detection frames."""
+        dy_sum = 0.0
+        dp_sum = 0.0
+        for ts, dy_t, dp_t in self._sends:
+            if ts >= capture_ms:
+                dy_sum += dy_t
+                dp_sum += dp_t
+        return dy_sum, dp_sum
 
     def current_bearing(self) -> tuple:
         """(d_yaw, d_pitch, bbox_h, bbox_w, conf). Caller should check has_target() first."""
