@@ -178,7 +178,13 @@ def run_client(detector, sock, k=DEFAULT_K, fov=DEFAULT_FOV, conf=0.5,
         if eof:
             break
 
-        # 1) DETECTION LEG -- only fires when a fresh frame arrived
+        # 1) DETECTION LEG -- only fires when a fresh frame arrived.
+        # Rule: TargetState is a PURE FUNCTION of tracker.select on the latest detection. If
+        # tracker returns None (target genuinely gone after kill_patience, OR whole-frame miss
+        # past miss_patience), we RESET state so the control leg doesn't keep aiming at a
+        # ghost. DetectionSmoother + TargetTracker patience already absorb single-frame jitter
+        # below this layer; adding more grace HERE just makes the bot face dead space after a
+        # kill and ignore newly-arrived approach targets on the OTHER side of the screen.
         if png is not None:
             frame = None
             dets = []
@@ -193,18 +199,20 @@ def run_client(detector, sock, k=DEFAULT_K, fov=DEFAULT_FOV, conf=0.5,
                     if smoother is not None:
                         dets = smoother.update(dets)
                     target = tracker.select(dets, last_w, last_h, fov)
-                    if target is not None and tracker.engaging:
-                        # measure bearing IN THE CAPTURED FRAME. Pass capture_ms so TargetState
-                        # subtracts any expected mod-turn that happened AFTER capture (during the
-                        # inference round-trip) -- otherwise the snap is stale and the next emit
-                        # overshoots.
+                    if target is not None:
                         dy, dp = bearing_from_bbox(target.cx, target.cy, last_w, last_h, fov)
                         now_ms = time.time() * 1000.0
                         state.on_measurement(dy, dp, target.h, target.w, target.conf,
                                              now_ms, capture_ms=last_capture_ms)
-                    last_engaging = bool(target is not None and tracker.engaging)
+                        last_engaging = bool(tracker.engaging)
+                    else:
+                        # tracker says "no commit this frame" (lost target, or just outside
+                        # any cone). Drop state immediately — keeping it would mean the next
+                        # 300 ms of control ticks aim at thin air while a real target on the
+                        # other side of the screen gets ignored.
+                        state.reset()
+                        last_engaging = False
                     last_boxes = boxes_payload(dets, target, last_engaging)
-                    # cache focal so we can shift the ESP boxes by mod-turn-since-capture below
                     last_focal_px = (last_h / 2.0) / math.tan(math.radians(fov) / 2.0)
                 if debug:
                     age = (time.time() * 1000.0 - last_capture_ms) if last_capture_ms else -1
@@ -219,7 +227,9 @@ def run_client(detector, sock, k=DEFAULT_K, fov=DEFAULT_FOV, conf=0.5,
                     pass
             frames += 1
 
-        # 2) CONTROL LEG -- runs at send_hz regardless of frame arrival
+        # 2) CONTROL LEG -- runs at send_hz regardless of frame arrival.
+        # state drives EVERYTHING (no fallback to tracker._last — that was the v0.4 bug source:
+        # tracker._last hangs on the just-killed target for 4 frames of kill_patience).
         now = time.monotonic()
         if now - last_send < send_interval:
             continue
@@ -227,29 +237,21 @@ def run_client(detector, sock, k=DEFAULT_K, fov=DEFAULT_FOV, conf=0.5,
         now_ms = now * 1000.0
 
         sol = None
-        approach_target_in_dets = None     # if not engaging, we may still want to pan toward an approach target
         if state.has_target(now_ms) and last_w is not None and last_h is not None:
             dy, dp, h_px, w_px, c = state.current_bearing()
             sol = aim_from_bearing(dy, dp, h_px, k=k, frame_h=last_h, fov_deg=fov)
-            # account for the turn the mod is about to make from THIS action: subtract the
-            # expected actual movement (mirrored gain + clamp + deadzone) from our held bearing.
-            # Pass wall-clock ms so the send-history (used by on_measurement back-correction) is
-            # tagged with the SAME clock the mod stamps frames with.
+            if not last_engaging:
+                # APPROACH: target is outside the fire cone -> pan gently toward it (clamp to
+                # APPROACH_STEP_DEG so a 45° turn doesn't snap), and hold fire until it enters
+                # the cone (fireable=False).
+                s = APPROACH_STEP_DEG
+                sol = replace(sol, fireable=False,
+                              d_yaw=max(-s, min(s, sol.d_yaw)),
+                              d_pitch=max(-s, min(s, sol.d_pitch)))
+            # account for the turn the mod is about to make. Pass wall-clock ms so the send-
+            # history (used by on_measurement back-correction) is tagged with the SAME clock
+            # the mod stamps frames with.
             state.on_send(sol.d_yaw, sol.d_pitch, now_ms=time.time() * 1000.0)
-        # ESP overlay & "look to the other side" pan only matter when we have NO engage target
-        # AND there's a current TargetTracker approach selection -- handled inside the detection
-        # leg above by simply not updating state. If the tracker holds an approach selection on
-        # the most recent frame, fall back to the old per-frame approach output:
-        if sol is None and tracker._last is not None and not tracker.engaging and last_w is not None:
-            # build a one-shot approach solution from the tracker's last detection (no
-            # TargetState involvement -- approach is intentionally low-precision)
-            t = tracker._last
-            from .aim import aim_at as _aim_at_now
-            sol_app = _aim_at_now(t, last_w, last_h, fov, k=k)
-            s = APPROACH_STEP_DEG
-            sol = replace(sol_app, fireable=False,
-                          d_yaw=max(-s, min(s, sol_app.d_yaw)),
-                          d_pitch=max(-s, min(s, sol_app.d_pitch)))
 
         action = aim_to_action(sol, n_det=len(last_boxes))
         # ESP drift compensation: the boxes we have are from the LAST captured frame; since then the
