@@ -93,6 +93,10 @@ class OrtDetector:
     loaded. The Ultralytics .pt path is untouched."""
 
     def __init__(self, weights, conf=0.25, device="cpu", imgsz=640, iou=0.45, max_det=100):
+        # Add pip-installed CUDA/cuDNN DLL dirs to PATH BEFORE importing onnxruntime — otherwise the
+        # CUDA EP fails to load DLLs that live under nvidia/*/bin in site-packages. Idempotent +
+        # harmless on CPU / DirectML runs (those packages just won't be installed).
+        self._add_nvidia_dll_dirs()
         import onnxruntime as ort
         self.conf = float(conf)
         self.imgsz = int(imgsz)
@@ -170,6 +174,25 @@ class OrtDetector:
         self._nc = nc
         self.providers = self.session.get_providers()
         print(f"[OrtDetector] providers={self.providers}  imgsz={self.imgsz}  nc={nc}  conf={self.conf}")
+
+    @staticmethod
+    def _add_nvidia_dll_dirs():
+        """Tell the OS loader where the pip-installed CUDA/cuDNN/cuBLAS DLLs live so onnxruntime's
+        CUDA EP can resolve them. Without this you get `Error 126: ...cudnn64_9.dll missing` even
+        though `pip install nvidia-cudnn-cu12` succeeded."""
+        import os
+        import sys
+        for pkg in ("cudnn", "cublas", "cuda_runtime", "cuda_nvrtc", "cufft", "curand", "cusolver", "cusparse"):
+            d = os.path.join(sys.prefix, "Lib", "site-packages", "nvidia", pkg, "bin")
+            if os.path.isdir(d):
+                # both PATH (subprocess / older loaders) and add_dll_directory (Python 3.8+ on Win)
+                if d not in os.environ.get("PATH", ""):
+                    os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+                if hasattr(os, "add_dll_directory"):
+                    try:
+                        os.add_dll_directory(d)
+                    except (OSError, FileNotFoundError):
+                        pass
 
     @staticmethod
     def _letterbox(im, new_size):
