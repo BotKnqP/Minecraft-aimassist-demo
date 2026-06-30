@@ -23,7 +23,9 @@ It sees zombies in the rendered frame with YOLO, leads + drop-compensates the sh
 
 ### What it is
 
-This agent plays a horde-survival bow scenario in Minecraft **entirely from pixels**. At runtime it never reads entity coordinates from the game — a YOLO detector finds zombies in the rendered frame, the agent picks the nearest one, computes where to aim (screen bearing + range from the box size + Minecraft's exact arrow ballistics), and a small Fabric mod turns the view and looses the arrow.
+This agent plays a **CS2 `aim_botz`-style target-shooting drill** in Minecraft — **entirely from pixels**. At runtime it never reads entity coordinates from the game; a YOLO detector finds zombies in the rendered frame, the agent picks the nearest one to the crosshair, computes where to aim (screen bearing + range from the box size + Minecraft's exact arrow ballistics), and a small Fabric mod turns the view and looses the arrow.
+
+The main eval is the aim_botz arena (stationary / lightly-moving targets, repeated draw-aim-fire cycles — measures *aim precision per shot*). An older "horde-survival pressure test" (waves of approaching zombies — measures clears-under-load) still works from the same datapack but is no longer the primary scenario.
 
 Getting the detector is a self-contained loop: a Fabric mod records gameplay and **auto-labels it for free** (it projects each mob's true bounding box to the screen), so you train a zombie detector on your own footage with zero hand-labelling.
 
@@ -66,7 +68,7 @@ flowchart LR
 3. **Aim** — box center → relative `(yaw, pitch)` via a pinhole model **using the per-frame FOV**; box height → distance via the calibrated `k` (FOV-rescaled); `ballistic.solve_pitch` adds the gravity drop.
 4. **Act** — the mod turns the view (damped, ≤10°/tick, deadzone 1.2°) toward the aim point, holds the bow to charge, and looses when aligned (within 2°) + fully drawn. The `TargetState` keeps the bearing alive between detections by decaying it by the expected mod turn (gain + deadzone + clamp), with a 300 ms predict window for brief detection gaps. No target → ease pitch to horizon and keep scanning.
 
-**Honest limits.** The current detector is a single-class YOLOv8s at ~0.39 mAP (still weak on far/tiny zombies). With TensorRT-EP inference, the bottleneck is now detection quality, not throughput — at 30 Hz capture + 3 ms inference you have plenty of frames; the model just needs more training data to catch distant boxes.
+**Honest limits.** The current detector is a single-class YOLOv8s at ~0.39 mAP — fine on the aim_botz target drills, still weak on far/tiny zombies. With TensorRT-EP inference, the bottleneck is detection quality, not throughput — at 30 Hz capture + 3 ms inference you have plenty of frames; the model just needs more training data to catch distant boxes. On a stationary aim_botz lineup, per-shot accuracy is the right metric; on the legacy horde mode, clears-per-wave is the right metric and is gated by the same detector range.
 
 ### Requirements
 
@@ -100,7 +102,9 @@ cd ../mod
 
 In-game keys (added by the mod): **F6** cycle render resolution · **F7** vision runtime · **F8** record · **F9** toggle the box overlay · **F10** scripted bow-aimbot.
 
-A ready-made **CS2 "aim_botz"-style arena** datapack ships in [`datapacks/zombie_arena/`](datapacks/zombie_arena) — drop it in your world's `datapacks/`, `/reload`, and press the in-world **START** button to spawn up to 8 one-hit targets (its `clock`/`tick`/`spawn_one` functions also despawn corpses and clean up stray arrows). Use it as the training arena and the live test range.
+A ready-made **CS2 "aim_botz"-style arena** datapack ships in [`datapacks/zombie_arena/`](datapacks/zombie_arena) — drop it in your world's `datapacks/`, `/reload`, and press the in-world **START** button to spawn up to 8 one-hit targets (its `clock`/`tick`/`spawn_one` functions also despawn corpses and clean up stray arrows). **This is the primary test scenario**: stationary / barely-mobile targets, repeated draw-aim-fire cycles — you measure *per-shot accuracy*, not survival time. The same arena doubles as the training-data recorder.
+
+> If you want to stress-test crowd handling instead, raise the spawn cap and let the zombies close — same datapack, different parameters. That "horde-survival pressure test" is the legacy mode.
 
 **① Record training data** — build/load an arena that spawns zombies, then press **F8** and play (or let F10 drive). Frames + auto-labels land in `runs/run_*/` (output dir = `RecorderConfig.outputBaseDir` — edit to your path).
 
@@ -159,7 +163,9 @@ MC_visi0n_aim/
 
 ### 这是什么
 
-本智能体在 Minecraft 里玩"波次生存弓箭战斗",**完全靠画面像素**。运行时它**不读取游戏里的实体坐标**——YOLO 检测器从渲染画面里认出僵尸,智能体选最近的一只,算出该往哪瞄(屏幕方位 + 由框大小估的距离 + Minecraft 精确箭矢弹道),再由一个 Fabric mod 转动视角、把箭射出去。
+本智能体在 Minecraft 里跑 **CS2 `aim_botz` 风格的打靶训练**,**完全靠画面像素**。运行时它**不读取游戏里的实体坐标**——YOLO 检测器从渲染画面里认出僵尸,智能体选离准星最近的一只,算出该往哪瞄(屏幕方位 + 由框大小估的距离 + Minecraft 精确箭矢弹道),再由一个 Fabric mod 转动视角、把箭射出去。
+
+**主测试场景就是 aim_botz 靶场**:静止 / 微动靶,反复拉弓-瞄准-放箭循环,度量的是**每箭命中率**。之前用过的"两波压力测试"(僵尸成群接近、考核扛压清场)仍可用同一个数据包跑,但已不是主测。
 
 检测器是自给自足练出来的:Fabric mod 一边录制一边**免费自动打标**(把每只怪的真实包围盒投影到屏幕),所以你用自己的录像训一个僵尸检测器,**零手工标注**。
 
@@ -202,7 +208,7 @@ flowchart LR
 3. **瞄准** —— 框中心 → 相对 `(yaw, pitch)`(针孔模型,**用每帧 FOV**);框高 → 距离(标定的 `k`,FOV 重缩);`ballistic.solve_pitch` 加重力落点补偿。
 4. **执行** —— mod 朝瞄点**阻尼转向**(≤10°/tick,死区 1.2°),拉弓蓄力,对齐(≤2°)+ 满蓄力时放箭。`TargetState` 在两次检测之间用预期 mod 转向衰减方位(增益 + 死区 + 截断),最多 300 ms 预测窗口扛住短暂漏检。无目标时把俯仰缓缓拉回地平线并继续扫描。
 
-**实话实说。** 当前检测器是单类 YOLOv8s,约 0.39 mAP(远处小僵尸仍漏)。上了 TensorRT-EP 后瓶颈已经从吞吐变成检测质量——30Hz 抓帧 + 3 ms 推理早就管够,模型本身需要更多录像训才能稳吃远框。
+**实话实说。** 当前检测器是单类 YOLOv8s,约 0.39 mAP —— 打 aim_botz 这种站桩靶完全够用,远处小僵尸仍漏。上了 TensorRT-EP 后瓶颈已经从吞吐变成检测质量——30Hz 抓帧 + 3 ms 推理早就管够,模型本身需要更多录像训才能稳吃远框。靶场模式看**每箭命中率**,legacy 横扫模式看**单波清场数**,两个指标都被同一个检测距离限制卡着。
 
 ### 环境要求
 
@@ -236,7 +242,9 @@ cd ../mod
 
 游戏内按键(mod 提供):**F6** 切换分辨率 · **F7** 视觉运行时 · **F8** 录制 · **F9** 开关识别框 · **F10** 脚本弓箭 aimbot。
 
-仓库自带一个 **CS2 "aim_botz" 风格靶场**数据包 [`datapacks/zombie_arena/`](datapacks/zombie_arena):放进你存档的 `datapacks/`、`/reload`,按世界里的 **START** 按钮即可刷出最多 8 个一击必杀靶(其 `clock`/`tick`/`spawn_one` 还会即时清除尸体、清理废箭)。既当训练靶场也当实测靶场。
+仓库自带一个 **CS2 "aim_botz" 风格靶场**数据包 [`datapacks/zombie_arena/`](datapacks/zombie_arena):放进你存档的 `datapacks/`、`/reload`,按世界里的 **START** 按钮即可刷出最多 8 个一击必杀靶(其 `clock`/`tick`/`spawn_one` 还会即时清除尸体、清理废箭)。**这就是主测试场景**:静止 / 几乎不动的靶,反复拉弓-瞄准-放箭,度量**每箭命中率**而不是存活时间。同一靶场也用来录训练数据。
+
+> 想测扛压清场?把刷新上限调高、让僵尸正常逼近,就退回到"两波压力测试"的玩法 —— 同一个数据包、不同参数。这是 legacy 模式。
 
 **① 录制训练数据** —— 搭/载入一个会刷僵尸的竞技场,按 **F8** 开录并游玩(或让 F10 自动打)。画面 + 自动标签落在 `runs/run_*/`(输出路径是 `RecorderConfig.outputBaseDir`,改成你的路径)。
 
